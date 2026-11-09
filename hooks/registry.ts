@@ -44,6 +44,8 @@ export type SessionRecord = {
   common?: string | null
   outbox?: Message[]
   seen?: string[]
+  // The person chose not to share the task line (userConfig shareTask: false).
+  isTaskHidden?: boolean
   ended?: boolean
 }
 
@@ -252,7 +254,7 @@ export const inboxBlock = (deliveries: readonly Delivery[], now: number): string
     ...deliveries.map(({ from, message }) => {
       const minutes = Math.max(0, Math.round((now - message.at) / 60_000))
       const where = `${from.repo ?? from.cwd}${from.ended ? ', session since ended' : ''}`
-      return `- from ${from.id.slice(0, 8)} (${where}, doing: ${from.intent || 'no task typed yet'}), ${minutes === 0 ? 'just now' : `${minutes} min ago`}${message.to === 'all' ? ', to all' : ''}: ${message.text}`
+      return `- from ${from.id.slice(0, 8)} (${where}, doing: ${taskOf(from)}), ${minutes === 0 ? 'just now' : `${minutes} min ago`}${message.to === 'all' ? ', to all' : ''}: ${message.text}`
     }),
     'Reply with the mcp__peer-sessions__message tool (to: the sender id) if it needs an answer, and tell the user if it changes their task.',
   ].join('\n')
@@ -261,6 +263,9 @@ export const releaseClaims = (record: SessionRecord, resources: readonly string[
   ...record,
   claims: resources.length ? (record.claims ?? []).filter(c => !resources.includes(c.resource)) : [],
 })
+
+export const taskOf = (record: SessionRecord): string =>
+  record.intent || (record.isTaskHidden ? 'task not shared' : 'no task typed yet')
 
 const ago = (then: number, now: number) => {
   const minutes = Math.max(0, Math.round((now - then) / 60_000))
@@ -275,7 +280,7 @@ export const describePeer = (peer: SessionRecord, now: number, ownRepo: string |
   const claims = (peer.claims ?? []).map(c => `${c.resource}${c.note ? ` (${c.note})` : ''}`)
   return [
     `- ${peer.id.slice(0, 8)} in ${where}${shared}`,
-    `  doing: ${peer.intent || '(no task typed yet)'}`,
+    `  doing: ${taskOf(peer)}`,
     `  recent edits: ${files}`,
     ...(claims.length ? [`  claims: ${claims.join(', ')}`] : []),
   ].join('\n')

@@ -1,8 +1,26 @@
 {
   "name": "peer-sessions",
-  "version": "0.3.0",
-  "description": "Parallel Claude Code sessions on one machine see each other: who is live, in which repo and branch, doing what, editing which files. Refuses once before an edit or a git commit/push that would race a live peer.",
+  "version": "0.4.0",
+  "description": "Parallel Claude Code sessions on one machine see each other, message each other and claim files, branches and ports. Holds back once before an edit or git command that would race a live peer.",
   "author": { "name": "Zaid Ali Syed" },
   "license": "MIT",
-  "keywords": ["coordination", "parallel-sessions", "hooks", "git", "race-conditions"]
+  "homepage": "https://github.com/zaidwhy/peer-sessions",
+  "repository": "https://github.com/zaidwhy/peer-sessions",
+  "keywords": ["coordination", "parallel-sessions", "multi-agent", "git", "worktrees", "race-conditions", "messaging"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "mode": {
+      "type": "string",
+      "title": "On a collision",
+      "description": "refuse: hold the edit or git command back once and tell the model why. warn: let it run and tell the model afterwards.",
+      "default": "refuse",
+      "options": ["refuse", "warn"]
+    },
+    "shareTask": {
+      "type": "boolean",
+      "title": "Share my task line",
+      "description": "Show other sessions the first line of what you asked this one to do. Off: they see that a session is live, its folder and files, not its task.",
+      "default": true
+    }
+  }
 }

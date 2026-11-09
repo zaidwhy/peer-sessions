@@ -1,4 +1,7 @@
+import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
+
+import type { BandView } from '../types'
 
 import {
   EDIT_CONFLICT_MS,
@@ -32,6 +35,7 @@ import {
   sameCheckout,
   shellWriteTargets,
   statusText,
+  taskOf,
   touch,
   type Message,
   type SessionRecord,
@@ -50,6 +54,14 @@ const INBOX_EVERY_MS = 10_000
 const MESSAGE_TTL_MINUTES = MESSAGE_TTL_MS / 60_000
 
 // Module state starts over on a reload; the record itself is re-read from disk.
+// userConfig: 'refuse' holds a colliding call back once, 'warn' lets it run and tells the model.
+let mode: 'refuse' | 'warn' = 'refuse'
+let isTaskShared = true
+const BAND_EMPTY: BandView = { inCheckout: [], message: null, dismissedAt: null }
+// Change the tag when BandView's fields change: it declines what an earlier version stored.
+const band = atom({ plugin: 'peer-sessions', key: 'band' } as const, BAND_EMPTY, { shape: 'band-2' })
+// A message stays on the band this long, unless dismissed.
+const BAND_MESSAGE_MS = 10 * 60_000
 let own: SessionRecord | null = null
 let registryDir: string | null = null
 let announced = new Set<string>()
@@ -142,7 +154,10 @@ async function livePeers($: EngineInterface): Promise<SessionRecord[]> {
 }
 
 function showStatus($: EngineInterface, peers: readonly SessionRecord[]): void {
-  $.ui.status(statusText(peers, own?.repo ?? null))
+  const repo = own?.repo ?? null
+  $.ui.status(statusText(peers, repo))
+  const inCheckout = sameCheckout(peers, repo).map(p => ({ id: p.id.slice(0, 8), intent: taskOf(p), branch: p.branch }))
+  update($, band, view => ({ ...view, inCheckout })).catch(() => undefined)
 }
 
 async function beat($: EngineInterface): Promise<void> {
@@ -164,10 +179,10 @@ async function guardWrites($: EngineInterface, paths: readonly string[], shown: 
     if (edited && !hasSeenIt && !warned.has(`edit|${edited.peer.id}|${path}`)) {
       warned.add(`edit|${edited.peer.id}|${path}`)
       const minutes = Math.max(0, Math.round((now - edited.touchedAt) / 60_000))
-      await handoff($, edited.peer, `I was about to write ${path}, which you edited ${minutes} min ago; I was told to re-read it first. My task: ${own?.intent || 'no task typed yet'}.`)
+      await handoff($, edited.peer, `I was about to write ${path}, which you edited ${minutes} min ago; I was told to re-read it first. My task: ${own ? taskOf(own) : 'no task typed yet'}.`)
       return [
         `[peer-sessions] Session ${edited.peer.id.slice(0, 8)} (${edited.peer.repo ?? edited.peer.cwd}) edited ${path} ${minutes} min ago and is still live.`,
-        `It is doing: ${edited.peer.intent || 'no task typed yet'}.`,
+        `It is doing: ${taskOf(edited.peer)}.`,
         'Re-read the file before writing so you do not overwrite its change (that session has been told). If your change overlaps its task, message it (mcp__peer-sessions__message) or ask the user first.',
         `This refusal fires once per file per peer within ${EDIT_CONFLICT_MS / 60_000} min: ${shown} made after re-reading goes through.`,
       ].join(' ')
@@ -175,10 +190,10 @@ async function guardWrites($: EngineInterface, paths: readonly string[], shown: 
     const claimed = claimConflict(peers, path)
     if (claimed && !warned.has(`claim|${claimed.peer.id}|${path}`)) {
       warned.add(`claim|${claimed.peer.id}|${path}`)
-      await handoff($, claimed.peer, `I was about to write ${path}, inside your claim ${claimed.claim.resource}. My task: ${own?.intent || 'no task typed yet'}. Tell me if I should keep out.`)
+      await handoff($, claimed.peer, `I was about to write ${path}, inside your claim ${claimed.claim.resource}. My task: ${own ? taskOf(own) : 'no task typed yet'}. Tell me if I should keep out.`)
       return [
         `[peer-sessions] ${path} is inside ${claimed.claim.resource}, which live session ${claimed.peer.id.slice(0, 8)} claimed${claimed.claim.note ? ` (${claimed.claim.note})` : ''}.`,
-        `It is doing: ${claimed.peer.intent || 'no task typed yet'}.`,
+        `It is doing: ${taskOf(claimed.peer)}.`,
         'That session has been told. Ask it (mcp__peer-sessions__message) or the user before changing what it owns. Running the same change again goes through.',
       ].join(' ')
     }
@@ -220,18 +235,18 @@ async function checkGit($: EngineInterface, command: unknown): Promise<string | 
   const held = branch && checkout.common && !isMovingAway ? branchConflict(peers, branch, checkout.common) : null
   if (held && !warned.has(`branch|${held.peer.id}|${held.claim.resource}|${verb}`)) {
     warned.add(`branch|${held.peer.id}|${held.claim.resource}|${verb}`)
-    await handoff($, held.peer, `I was about to git ${verb} on ${branch}, which you claimed. My task: ${own?.intent || 'no task typed yet'}.`)
+    await handoff($, held.peer, `I was about to git ${verb} on ${branch}, which you claimed. My task: ${own ? taskOf(own) : 'no task typed yet'}.`)
     return [
-      `[peer-sessions] Branch ${branch} of this repository is claimed by live session ${held.peer.id.slice(0, 8)}${held.claim.note ? ` (${held.claim.note})` : ''}, doing: ${held.peer.intent || 'no task typed yet'}.`,
+      `[peer-sessions] Branch ${branch} of this repository is claimed by live session ${held.peer.id.slice(0, 8)}${held.claim.note ? ` (${held.claim.note})` : ''}, doing: ${taskOf(held.peer)}.`,
       `git ${verb} on it can race that session's work. That session has been told. Agree with it (mcp__peer-sessions__message) or the user first, or work on your own branch. Running the same command again goes through.`,
     ].join(' ')
   }
   const peer = sameCheckout(peers, repo).find(p => !warned.has(`git|${p.id}|${repo}|${verb}`))
   if (!peer) return null
   warned.add(`git|${peer.id}|${repo}|${verb}`)
-  await handoff($, peer, `I was about to run git ${verb} in ${repo}, the checkout you are working in. My task: ${own?.intent || 'no task typed yet'}.`)
+  await handoff($, peer, `I was about to run git ${verb} in ${repo}, the checkout you are working in. My task: ${own ? taskOf(own) : 'no task typed yet'}.`)
   return [
-    `[peer-sessions] Session ${peer.id.slice(0, 8)} is live in the checkout this git ${verb} acts on (${repo}${peer.branch ? ` @ ${peer.branch}` : ''}), doing: ${peer.intent || 'no task typed yet'}.`,
+    `[peer-sessions] Session ${peer.id.slice(0, 8)} is live in the checkout this git ${verb} acts on (${repo}${peer.branch ? ` @ ${peer.branch}` : ''}), doing: ${taskOf(peer)}.`,
     `git ${verb} there can sweep its uncommitted changes into your commit, move the branch under it, or race its push.`,
     'That session has been told. Run git status and git fetch, check what is yours, and coordinate with it (mcp__peer-sessions__message) or ask the user. Running the same command again goes through.',
   ].join(' ')
@@ -255,7 +270,7 @@ async function claim($: EngineInterface, input: Record<string, unknown>): Promis
   const clashes = overlappingClaims(await livePeers($), resources)
   const held = (own.claims ?? []).map(c => c.resource).join(', ')
   if (!clashes.length) return `Claimed: ${resources.join(', ')}. Peers editing inside these are refused once and told your task. You now hold: ${held}.`
-  const lines = clashes.map(({ peer, claim: c }) => `- ${c.resource} is held by ${peer.id.slice(0, 8)}${c.note ? ` (${c.note})` : ''}, doing: ${peer.intent || 'no task typed yet'}`)
+  const lines = clashes.map(({ peer, claim: c }) => `- ${c.resource} is held by ${peer.id.slice(0, 8)}${c.note ? ` (${c.note})` : ''}, doing: ${taskOf(peer)}`)
   return [`Claimed, but these overlap claims live peers already hold:`, ...lines, 'Agree with that session (SendMessage) or the user who owns it before working there.'].join('\n')
 }
 
@@ -304,6 +319,12 @@ async function takeInbox($: EngineInterface, isForced: boolean): Promise<string 
   if (!deliveries.length || !own) return null
   own = markSeen(own, deliveries.map(d => d.message.id))
   await save($)
+  const latest = deliveries[deliveries.length - 1]
+  if (latest) {
+    const from = latest.from.id.slice(0, 8)
+    $.ui.toast(`peer-sessions: ${deliveries.length > 1 ? `${deliveries.length} messages, latest ` : ''}from ${from}: ${latest.message.text.slice(0, 160)}`)
+    await update($, band, view => ({ ...view, message: { from, text: latest.message.text, at: latest.message.at } }))
+  }
   return inboxBlock(deliveries, now)
 }
 
@@ -315,7 +336,7 @@ async function noteRead($: EngineInterface, raw: unknown): Promise<void> {
 async function briefing($: EngineInterface, text: string): Promise<string | null> {
   if (!(await ensureOwn($)) || !own) return null
   const intent = intentFrom(text)
-  if (intent) own = { ...own, intent }
+  if (intent) own = isTaskShared ? { ...own, intent, isTaskHidden: false } : { ...own, intent: '', isTaskHidden: true }
   await refreshCheckout($)
   await save($)
   const peers = await livePeers($)
@@ -348,6 +369,37 @@ async function peersReport($: EngineInterface): Promise<string> {
   const now = await $.clock.now()
   const repo = own?.repo ?? null
   return [`${peers.length} other live session(s):`, ...peers.map(peer => describePeer(peer, now, repo))].join('\n') + holding
+}
+
+const COMMAND_HELP = [
+  '/peer-sessions                      list the other live sessions and what they claim',
+  '/peer-sessions msg <id|all> <text>  send a message (it reaches them with their next tool result or prompt)',
+  '/peer-sessions claim <what> [...]   claim files, folders, branch:<name>, port:<n> for this session',
+  '/peer-sessions release [<what> ...] give claims back (all of them with no argument)',
+  '/peer-sessions help                 this list',
+].join('\n')
+
+// The person's own way in: the same registry the model's tools use.
+async function runCommand($: EngineInterface, args: string): Promise<string> {
+  const [verb = '', ...rest] = args.trim().split(/\s+/).filter(Boolean)
+  switch (verb.toLowerCase()) {
+    case '':
+    case 'list':
+      return peersReport($)
+    case 'msg':
+    case 'message': {
+      const [to = '', ...words] = rest
+      return sendMessage($, { to, text: words.join(' ') })
+    }
+    case 'claim':
+      return claim($, { resources: rest, note: 'claimed by the user' })
+    case 'release':
+      return claim($, { resources: rest, release: true })
+    case 'help':
+      return COMMAND_HELP
+    default:
+      return `Unknown: ${verb}.\n${COMMAND_HELP}`
+  }
 }
 
 async function endOwn($: EngineInterface, sessionId: string): Promise<void> {
@@ -401,7 +453,10 @@ async function registerSurface($: EngineInterface): Promise<void> {
   })
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  mode = options.mode === 'warn' ? 'warn' : 'refuse'
+  isTaskShared = options.shareTask !== false
+
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     try {
@@ -452,18 +507,54 @@ export const register: Register = on => {
       deny = await checkGit($, input.command).catch(() => null)
       deny ??= await checkShellWrites($, input.command).catch(() => null)
     }
-    if (deny) return { deny }
+    if (deny) $.ui.toast(`peer-sessions: ${mode === 'warn' ? 'warned about' : 'held back'} ${e.tool}: ${deny.replace('[peer-sessions] ', '').slice(0, 180)}`)
+    if (deny && mode === 'refuse') return { deny }
     const ran = await next(e)
-    if (ran.deny !== undefined || ran.isError) return ran
+    if (ran.deny !== undefined) return ran
+    if (deny) {
+      const warning = `${deny.replace('[peer-sessions]', '[peer-sessions] (warn mode: the call ran anyway)')} Check what you just did against that session's work.`
+      return { ...ran, context: [...(ran.context ?? []), warning] }
+    }
+    if (ran.isError) return ran
     if (READ_TOOLS.has(e.tool)) await noteRead($, input.file_path ?? input.notebook_path).catch(() => undefined)
     const inbox = await takeInbox($, false).catch(() => null)
     return inbox ? { ...ran, context: [...(ran.context ?? []), inbox] } : ran
   // next is replay-safe here: after the tool ran it hands back that result, never a second run.
   }).catch(($, e, next) => next(e))
 
-  on('command.run', { command: 'peer-sessions' }, async $ => ({
-    text: await peersReport($).catch(error => `peer-sessions: could not read the registry (${String(error)}).`),
+  on('command.run', { command: 'peer-sessions' }, async ($, e) => ({
+    text: await runCommand($, e.args).catch(error => `peer-sessions: the command failed (${String(error)}).`),
   })).catch(() => ({ text: 'peer-sessions: the command failed; the registry is untouched.' }))
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const view = await read($, band)
+    const now = await $.clock.now()
+    const message = view.message && (view.dismissedAt === null || view.message.at > view.dismissedAt) && now - view.message.at <= BAND_MESSAGE_MS ? view.message : null
+    if (e.props.hasSurvey || (!message && view.inCheckout.length === 0)) return next(e)
+    const { Box, Button, Text } = $.ui.resolve(e)
+    const peerLine = view.inCheckout
+      .slice(0, 3)
+      .map(p => `${p.id}${p.branch ? ` on ${p.branch}` : ''}: ${p.intent}`)
+      .join(' | ')
+    return (
+      <Box flexDirection="column">
+        {view.inCheckout.length > 0 && (
+          <Text color="yellow">
+            {`peer-sessions: ${view.inCheckout.length} other session${view.inCheckout.length > 1 ? 's' : ''} in this checkout (${peerLine})`}
+          </Text>
+        )}
+        {message && (
+          <Box key="message">
+            <Text>{`message from ${message.from}: ${message.text.slice(0, 200)} `}</Text>
+            <Button key="dismiss" label="Dismiss" onPress={async () => {
+                const at = await $.clock.now()
+                await update($, band, v => ({ ...v, dismissedAt: at }))
+              }} />
+          </Box>
+        )}
+      </Box>
+    )
+  })
 
   on('session.end', async ($, e, next) => {
     // A missed tombstone is harmless: the record ages out after LIVE_MS.

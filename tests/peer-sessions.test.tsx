@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { gitBranch, gitDir, intentFrom, normPath, normResource, racingGitVerb, shellWriteTargets, SHAPE } from '../hooks/registry'
+import { describePeer, gitBranch, gitDir, intentFrom, normPath, normResource, racingGitVerb, shellWriteTargets, SHAPE } from '../hooks/registry'
 
 const HOME = 'C:/Users/dev'
 const DIR = `${HOME}/.claude/peer-sessions`
@@ -20,6 +20,7 @@ function world(on: On, options: { repo?: string | null; isDiskBroken?: boolean }
   const files = new Map<string, File>()
   const statuses: (string | undefined)[] = []
   const ranTools: string[] = []
+  const toasts: string[] = []
   const repo = options.repo === undefined ? 'C:/work/app' : options.repo
 
   on('session.id', () => ({ value: OWN_ID }))
@@ -27,6 +28,10 @@ function world(on: On, options: { repo?: string | null; isDiskBroken?: boolean }
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   on('command.register', () => ({ value: { command: 'peer-sessions' } }))
+  on('ui.toast', (_, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
   on('ui.status', (_, e) => {
     statuses.push(e.text)
     return { value: undefined }
@@ -88,7 +93,7 @@ function world(on: On, options: { repo?: string | null; isDiskBroken?: boolean }
 
   const ownRecord = () => JSON.parse(files.get(`${DIR}/${OWN_ID}.json`)?.text ?? 'null')
 
-  return { clock, files, statuses, ranTools, seedPeer, ownRecord }
+  return { clock, files, statuses, ranTools, toasts, seedPeer, ownRecord }
 }
 
 const typed = (text: string) => ({ text, origin: { kind: 'composer' as const }, wait: false })
@@ -509,4 +514,102 @@ test('a message from a session that has since ended still arrives, marked as end
   expect(contextOf(ran)).toContain('I pushed main, pull before you commit')
   expect(contextOf(ran)).toContain('session since ended')
   expect(JSON.stringify(await $.tool.call({ tool: 'mcp__peer-sessions__peers' }))).toContain('No other live Claude sessions')
+})
+
+test('warn mode lets the colliding edit run and tells the model afterwards', { options: { mode: 'warn' } }, async ($, on) => {
+  const w = world(on)
+  w.seedPeer()
+  await $.session.start(start)
+
+  const ran = await $.tool.call({ tool: 'Edit', file_path: 'C:/work/app/src/invoice.py', old_string: 'a', new_string: 'b' })
+  expect(w.ranTools).toEqual(['Edit'])
+  expect(contextOf(ran)).toContain('(warn mode: the call ran anyway)')
+  expect(w.toasts.join('\n')).toContain('warned about Edit')
+})
+
+test('refuse mode shows a toast for the person as well', async ($, on) => {
+  const w = world(on)
+  w.seedPeer()
+  await $.session.start(start)
+
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/work/app/src/invoice.py', old_string: 'a', new_string: 'b' })
+  expect(w.toasts.join('\n')).toContain('held back Edit')
+})
+
+test('with shareTask off the task line never reaches the registry', { options: { shareTask: false } }, async ($, on) => {
+  const w = world(on)
+  await $.session.start(start)
+
+  await $.prompt.submit(typed('rotate the production database credentials'))
+  expect(w.ownRecord().intent).toBe('')
+  expect(w.ownRecord().isTaskHidden).toBe(true)
+  expect(JSON.stringify(w.files.get(`${DIR}/${OWN_ID}.json`))).not.toContain('credentials')
+  expect(describePeer(w.ownRecord(), w.clock.now(), null)).toContain('doing: task not shared')
+})
+
+test('the person can message, claim and release from /peer-sessions', async ($, on) => {
+  const w = world(on)
+  w.seedPeer()
+  on('command.run', () => ({ text: 'engine' }))
+  await $.session.start(start)
+  const run = (args: string) => $.command.run({ command: 'peer-sessions', args, origin: { kind: 'composer' } } as never)
+
+  expect((await run('msg bbbbbbbb please leave src/api to me')).text).toContain('Sent to session bbbbbbbb')
+  expect(w.ownRecord().outbox[0].text).toBe('please leave src/api to me')
+  expect((await run('claim src/api port:3000')).text).toContain('Claimed: c:/work/app/src/api, port:3000')
+  expect((await run('release port:3000')).text).toContain('Released: port:3000')
+  expect(w.ownRecord().claims.map((c: { resource: string }) => c.resource)).toEqual(['c:/work/app/src/api'])
+  expect((await run('help')).text).toContain('/peer-sessions msg <id|all> <text>')
+  expect((await run('frobnicate')).text).toContain('Unknown: frobnicate.')
+})
+
+test('an arriving message raises a toast', async ($, on) => {
+  const w = world(on)
+  await $.session.start(start)
+  w.seedPeer({ outbox: [{ id: 'm5', to: 'all', text: 'staging is down, do not deploy', at: w.clock.now() }] })
+
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect(w.toasts.join('\n')).toContain('from bbbbbbbb: staging is down, do not deploy')
+})
+
+const BAND = {
+  plugin: 'peer-sessions',
+  component: 'AbovePrompt',
+  props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 100, scroll: { offset: 0, bodyRows: 10 } },
+} as const
+
+test('the band names peers in this checkout and the latest message, on every surface', async ($, on) => {
+  const w = world(on)
+  on('ui.render', ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>engine</Text>
+  })
+  w.seedPeer({ outbox: [{ id: 'm6', to: 'aaaaaaaa', text: 'pushing main in 5 min', at: w.clock.now() }] })
+  await $.session.start(start)
+  await $.prompt.submit(typed('add rate limiting to the upload endpoint'))
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...BAND, surface } as never)
+    expect((await ui.find({ type: 'Text', text: /in this checkout/ }))?.text).toContain('1 other session in this checkout (bbbbbbbb on main: refactor the invoice parser)')
+    expect((await ui.find({ type: 'Text', text: /pushing main in 5 min/ }))).toBeDefined()
+    await ui.unmount()
+  }
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' } as never)
+  await ui.press({ key: 'dismiss' })
+  expect(await ui.find({ type: 'Text', text: /pushing main/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('the band stays out of the way when nothing is shared', async ($, on) => {
+  world(on)
+  on('ui.render', ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>engine</Text>
+  })
+  await $.session.start(start)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' } as never)
+  expect((await ui.find({ type: 'Text' }))?.text).toBe('engine')
+  await ui.unmount()
 })
