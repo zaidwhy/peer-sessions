@@ -1,12 +1,12 @@
 {
   "name": "peer-sessions",
-  "version": "0.4.0",
-  "description": "Parallel Claude Code sessions on one machine see each other, message each other and claim files, branches and ports. Holds back once before an edit or git command that would race a live peer.",
+  "version": "0.5.0",
+  "description": "Parallel Claude Code sessions on one machine see each other, message and wait for each other, remember what earlier sessions did in a repository, and claim files, branches and ports. Holds back once before an edit or git command that would race a live peer.",
   "author": { "name": "Zaid Ali Syed" },
   "license": "MIT",
   "homepage": "https://github.com/zaidwhy/peer-sessions",
   "repository": "https://github.com/zaidwhy/peer-sessions",
-  "keywords": ["coordination", "parallel-sessions", "multi-agent", "git", "worktrees", "race-conditions", "messaging"],
+  "keywords": ["coordination", "parallel-sessions", "multi-agent", "git", "worktrees", "race-conditions", "messaging", "session-memory"],
   "types": "./types/index.d.ts",
   "userConfig": {
     "mode": {

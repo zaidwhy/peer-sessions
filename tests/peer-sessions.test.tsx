@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { describePeer, gitBranch, gitDir, intentFrom, normPath, normResource, racingGitVerb, shellWriteTargets, SHAPE } from '../hooks/registry'
+import { describePeer, durationText, gitBranch, gitDir, intentFrom, normPath, normResource, racingGitVerb, shellWriteTargets, SHAPE } from '../hooks/registry'
 
 const HOME = 'C:/Users/dev'
 const DIR = `${HOME}/.claude/peer-sessions`
@@ -21,6 +21,7 @@ function world(on: On, options: { repo?: string | null; isDiskBroken?: boolean }
   const statuses: (string | undefined)[] = []
   const ranTools: string[] = []
   const toasts: string[] = []
+  const submitted: string[] = []
   const repo = options.repo === undefined ? 'C:/work/app' : options.repo
 
   on('session.id', () => ({ value: OWN_ID }))
@@ -69,7 +70,12 @@ function world(on: On, options: { repo?: string | null; isDiskBroken?: boolean }
         isLink: false,
       })) }
   })
-  on('prompt.submit', (_, e) => ({ text: e.text, context: e.context }))
+  on('prompt.submit', (_, e) => {
+    submitted.push(e.text)
+    return { text: e.text, context: e.context }
+  })
+  on('turn.start', (_, e) => ({ turnId: e.turnId, kind: 'engine' as const, ref: 0 }))
+  on('turn.complete', (_, e) => e as never)
   on('tool.call', (_, e) => {
     ranTools.push(e.tool)
     return { result: {} }
@@ -93,7 +99,7 @@ function world(on: On, options: { repo?: string | null; isDiskBroken?: boolean }
 
   const ownRecord = () => JSON.parse(files.get(`${DIR}/${OWN_ID}.json`)?.text ?? 'null')
 
-  return { clock, files, statuses, ranTools, toasts, seedPeer, ownRecord }
+  return { clock, files, statuses, ranTools, toasts, submitted, seedPeer, ownRecord }
 }
 
 const typed = (text: string) => ({ text, origin: { kind: 'composer' as const }, wait: false })
@@ -612,4 +618,212 @@ test('the band stays out of the way when nothing is shared', async ($, on) => {
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' } as never)
   expect((await ui.find({ type: 'Text' }))?.text).toBe('engine')
   await ui.unmount()
+})
+
+const HOUR = 3_600_000
+const COMMON = 'c:/work/app/.git'
+
+// A second record on the in-memory disk, for trails with more than one earlier session.
+function seedOther(w: ReturnType<typeof world>, id: string, fields: Record<string, unknown>) {
+  w.files.set(`${DIR}/${id}.json`, {
+    mtimeMs: w.clock.now(),
+    text: JSON.stringify({ shape: SHAPE, id, cwd: 'c:/work/app', repo: 'c:/work/app', branch: 'main', common: COMMON, started: 0, intent: '', touched: {}, ...fields }),
+  })
+}
+
+test('the first prompt in a repository hears what earlier sessions there did', async ($, on) => {
+  const w = world(on)
+  await w.clock.set(10 * 24 * HOUR)
+  const now = w.clock.now()
+  seedOther(w, 'cccccccc-ended', { ended: true, started: now - 3 * HOUR, intent: 'migrate the users table to uuid keys', touched: { 'c:/work/app/db/migrate.py': now - 2 * HOUR } })
+  seedOther(w, 'dddddddd-elsewhere', { ended: true, repo: 'c:/work/other', common: 'c:/work/other/.git', intent: 'unrelated work in another repo', touched: { 'c:/work/other/x.py': now - HOUR } })
+  await $.session.start(start)
+
+  const brief = (await $.prompt.submit(typed('add rate limiting to the upload endpoint'))).context?.join(' ') ?? ''
+  expect(brief).toContain('Earlier Claude sessions in this repository')
+  expect(brief).toContain('2 h ago, cccccccc: migrate the users table to uuid keys')
+  expect(brief).toContain('wrote: c:/work/app/db/migrate.py')
+  expect(brief).not.toContain('unrelated work in another repo')
+})
+
+test('the first write to a file says which session wrote it last, once', async ($, on) => {
+  const w = world(on)
+  await w.clock.set(10 * 24 * HOUR)
+  const now = w.clock.now()
+  seedOther(w, 'cccccccc-ended', { ended: true, intent: 'migrate the users table to uuid keys', touched: { 'c:/work/app/db/migrate.py': now - 3 * HOUR } })
+  await $.session.start(start)
+
+  const first = await $.tool.call({ tool: 'Edit', file_path: 'C:/work/app/db/migrate.py', old_string: 'a', new_string: 'b' })
+  expect(w.ranTools).toEqual(['Edit'])
+  expect(contextOf(first)).toContain('last written 3 h ago by session cccccccc (session since ended), doing: migrate the users table to uuid keys')
+
+  const second = await $.tool.call({ tool: 'Edit', file_path: 'C:/work/app/db/migrate.py', old_string: 'b', new_string: 'c' })
+  expect(contextOf(second)).not.toContain('last written')
+})
+
+test('a write older than a day is not worth mentioning', async ($, on) => {
+  const w = world(on)
+  await w.clock.set(10 * 24 * HOUR)
+  seedOther(w, 'cccccccc-ended', { ended: true, intent: 'old work', touched: { 'c:/work/app/db/migrate.py': w.clock.now() - 30 * HOUR } })
+  await $.session.start(start)
+
+  const ran = await $.tool.call({ tool: 'Edit', file_path: 'C:/work/app/db/migrate.py', old_string: 'a', new_string: 'b' })
+  expect(contextOf(ran)).not.toContain('last written')
+})
+
+test('a pinned note reaches sessions in the repository, outlives its author, and expires', async ($, on) => {
+  const w = world(on)
+  await w.clock.set(10 * 24 * HOUR)
+  const now = w.clock.now()
+  seedOther(w, 'cccccccc-ended', {
+    ended: true,
+    notes: [
+      { id: 'n1', text: 'staging DB credentials were rotated, use the new .env.staging', at: now - HOUR, until: now + 23 * HOUR, scope: COMMON },
+      { id: 'n2', text: 'this one has expired', at: now - 30 * HOUR, until: now - 6 * HOUR, scope: COMMON },
+      { id: 'n3', text: 'note for another repo', at: now - HOUR, until: now + HOUR, scope: 'c:/work/other/.git' },
+    ],
+  })
+  await $.session.start(start)
+
+  const brief = (await $.prompt.submit(typed('add rate limiting to the upload endpoint'))).context?.join(' ') ?? ''
+  expect(brief).toContain('cccccccc (ended): staging DB credentials were rotated, use the new .env.staging')
+  expect(brief).not.toContain('this one has expired')
+  expect(brief).not.toContain('note for another repo')
+})
+
+test('pin and unpin from the tool; a live session gets a new note with its next prompt', async ($, on) => {
+  const w = world(on)
+  await $.session.start(start)
+  await $.prompt.submit(typed('add rate limiting to the upload endpoint'))
+
+  const pinned = JSON.stringify(await $.tool.call({ tool: 'mcp__peer-sessions__pin', text: 'do not touch the flaky e2e suite today', hours: 8 }))
+  expect(pinned).toContain('for 8 h')
+  const note = w.ownRecord().notes[0]
+  expect(note.scope).toBe(COMMON)
+  expect(note.until - note.at).toBe(8 * HOUR)
+
+  seedOther(w, 'eeeeeeee-live', { notes: [{ id: 'n9', text: 'merging the auth branch at 5pm', at: w.clock.now(), until: w.clock.now() + HOUR, scope: COMMON }] })
+  await w.clock.advance(61_000)
+  const later = (await $.prompt.submit(typed('now add tests for the rate limiter'))).context?.join(' ') ?? ''
+  expect(later).toContain('merging the auth branch at 5pm')
+  expect(later).not.toContain('flaky e2e suite')
+
+  expect(JSON.stringify(await $.tool.call({ tool: 'mcp__peer-sessions__pin', unpin: note.id }))).toContain(`Unpinned ${note.id}`)
+  expect(w.ownRecord().notes).toEqual([])
+})
+
+test('history names every session that wrote a file, this one included', async ($, on) => {
+  const w = world(on)
+  await w.clock.set(10 * 24 * HOUR)
+  const now = w.clock.now()
+  seedOther(w, 'cccccccc-ended', { ended: true, intent: 'first pass at the parser', touched: { 'c:/work/app/src/parse.py': now - 5 * HOUR } })
+  await $.session.start(start)
+  await $.prompt.submit(typed('second pass at the parser edge cases'))
+  await $.tool.call({ tool: 'Write', file_path: 'C:/work/app/src/parse.py', content: 'x' })
+
+  const text = JSON.stringify(await $.tool.call({ tool: 'mcp__peer-sessions__history', path: 'src/parse.py' }))
+  expect(text).toContain('just now, aaaaaaaa (this session): second pass at the parser edge cases')
+  expect(text).toContain('5 h ago, cccccccc (ended): first pass at the parser')
+})
+
+test('wait_for returns once a peer gives the branch back', async ($, on) => {
+  const w = world(on)
+  w.seedPeer({ common: COMMON, claims: [{ resource: `branch:main@${COMMON}`, note: 'release cut', at: 0 }] })
+  await $.session.start(start)
+
+  const pending = $.tool.call({ tool: 'mcp__peer-sessions__wait_for', target: 'branch:main', timeoutSeconds: 60 })
+  await w.clock.advance(5_000)
+  w.seedPeer({ common: COMMON, claims: [] })
+  await w.clock.advance(5_000)
+  expect(JSON.stringify(await pending)).toContain(`branch:main@${COMMON} was released after 6 s`)
+})
+
+const PORT_HELD = { common: COMMON, claims: [{ resource: 'port:3000', note: 'dev server', at: 0 }] }
+
+// Holds the claim fresh while the clock moves, as a live peer's heartbeat would.
+async function holdFor(w: ReturnType<typeof world>, ms: number, fields: Record<string, unknown> = PORT_HELD) {
+  for (let t = 0; t < ms; t += 5_000) {
+    w.seedPeer(fields)
+    await w.clock.advance(5_000)
+  }
+}
+
+test('wait_for hands a long wait to a watch that wakes the idle session when the claim clears', async ($, on) => {
+  const w = world(on)
+  w.seedPeer(PORT_HELD)
+  await $.session.start(start)
+
+  const pending = $.tool.call({ tool: 'mcp__peer-sessions__wait_for', target: 'port:3000', timeoutSeconds: 600 })
+  await holdFor(w, 10_000)
+  expect(JSON.stringify(await pending)).toContain('Still held: port:3000 is still claimed by bbbbbbbb (dev server). Watching it for up to 10 min')
+
+  await holdFor(w, 20_000)
+  expect(w.submitted.join(' ')).not.toContain('port:3000')
+
+  w.seedPeer({ common: COMMON, claims: [] })
+  await w.clock.advance(5_000)
+  expect(w.submitted.join(' ')).toContain('port:3000 was released after 35 s of waiting: go ahead.')
+  expect(w.toasts.join(' ')).toContain('port:3000 was released')
+})
+
+test('a watch that clears mid-turn arrives with the next tool result instead of a new prompt', async ($, on) => {
+  const w = world(on)
+  w.seedPeer(PORT_HELD)
+  await $.session.start(start)
+  const pending = $.tool.call({ tool: 'mcp__peer-sessions__wait_for', target: 'port:3000' })
+  await holdFor(w, 10_000)
+  await pending
+
+  await $.turn.start({ text: 'carry on with the tests', turnId: 't1' } as never)
+  w.seedPeer({ common: COMMON, claims: [] })
+  await w.clock.advance(5_000)
+  expect(w.submitted.join(' ')).not.toContain('was released')
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect(contextOf(ran)).toContain('port:3000 was released')
+})
+
+test('a watch stops at its timeout and says who still holds it', async ($, on) => {
+  const w = world(on)
+  w.seedPeer(PORT_HELD)
+  await $.session.start(start)
+  const pending = $.tool.call({ tool: 'mcp__peer-sessions__wait_for', target: 'port:3000', timeoutSeconds: 30 })
+  await holdFor(w, 10_000)
+  await pending
+
+  await holdFor(w, 25_000)
+  expect(w.submitted.join(' ')).toContain('Stopped watching port:3000')
+  expect(w.submitted.join(' ')).toContain('still claimed by bbbbbbbb (dev server)')
+})
+
+test('wait_for on a session id returns when that session ends; on a free resource at once', async ($, on) => {
+  const w = world(on)
+  w.seedPeer()
+  await $.session.start(start)
+
+  expect(JSON.stringify(await $.tool.call({ tool: 'mcp__peer-sessions__wait_for', target: 'db:local' }))).toContain('Nobody holds db:local')
+
+  const pending = $.tool.call({ tool: 'mcp__peer-sessions__wait_for', target: 'bbbbbbbb', timeoutSeconds: 60 })
+  await w.clock.advance(5_000)
+  w.seedPeer({ ended: true })
+  await w.clock.advance(5_000)
+  expect(JSON.stringify(await pending)).toContain('Session bbbbbbbb ended after 6 s of waiting')
+})
+
+test('the person can pin, unpin and read history from /peer-sessions', async ($, on) => {
+  const w = world(on)
+  on('command.run', () => ({ text: 'engine' }))
+  await $.session.start(start)
+  const run = (args: string) => $.command.run({ command: 'peer-sessions', args, origin: { kind: 'composer' } } as never)
+
+  expect((await run('pin prod deploy freeze until Friday')).text).toContain('Pinned')
+  expect(w.ownRecord().notes[0].text).toBe('prod deploy freeze until Friday')
+  expect((await run('history')).text).toContain('prod deploy freeze until Friday')
+  expect((await run('unpin all')).text).toContain('Unpinned every note')
+})
+
+test('durations read naturally', () => {
+  expect(durationText(4_000)).toBe('4 s')
+  expect(durationText(150_000)).toBe('3 min')
+  expect(durationText(3 * 3_600_000)).toBe('3 h')
 })

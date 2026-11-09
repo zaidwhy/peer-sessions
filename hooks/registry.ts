@@ -29,6 +29,19 @@ export const MAX_OUTBOX = 20
 export const MAX_SEEN = 200
 export const MAX_MESSAGE_CHARS = 600
 
+// An ended session's record stays on disk; read back, it is the repository's trail.
+export const TRAIL_MS = 7 * 24 * 60 * 60_000
+// "Last written by" is only worth saying while it is recent enough to matter.
+export const BLAME_MS = 24 * 60 * 60_000
+export const MAX_TRAIL_SHOWN = 3
+export const MAX_NOTES = 10
+export const MAX_NOTE_TEXT = 400
+export const MAX_NOTE_HOURS = 7 * 24
+
+// A pinned note: everyone working in `scope` (a repository, or a folder outside
+// git) sees it until `until`, whether or not its author is still live.
+export type Note = { id: string; text: string; at: number; until: number; scope: string }
+
 export type SessionRecord = {
   shape: number
   id: string
@@ -46,6 +59,8 @@ export type SessionRecord = {
   seen?: string[]
   // The person chose not to share the task line (userConfig shareTask: false).
   isTaskHidden?: boolean
+  // Notes pinned for a repository; they live in this file, so they outlast the session.
+  notes?: Note[]
   ended?: boolean
 }
 
@@ -258,6 +273,86 @@ export const inboxBlock = (deliveries: readonly Delivery[], now: number): string
     }),
     'Reply with the mcp__peer-sessions__message tool (to: the sender id) if it needs an answer, and tell the user if it changes their task.',
   ].join('\n')
+
+// A repository is one thing across its worktrees; outside git, the folder is.
+export const scopeOf = (record: Pick<SessionRecord, 'common' | 'repo' | 'cwd'>): string =>
+  record.common ?? record.repo ?? record.cwd
+
+export const lastActivity = (record: SessionRecord): number => Math.max(record.started, ...Object.values(record.touched))
+
+export const agoText = (then: number, now: number): string => {
+  const minutes = Math.max(0, Math.round((now - then) / 60_000))
+  if (minutes < 1) return 'just now'
+  if (minutes < 90) return `${minutes} min ago`
+  const hours = Math.round(minutes / 60)
+  return hours < 36 ? `${hours} h ago` : `${Math.round(hours / 24)} days ago`
+}
+
+export const durationText = (ms: number): string => {
+  const seconds = Math.max(0, Math.round(ms / 1000))
+  if (seconds < 90) return `${seconds} s`
+  const minutes = Math.round(seconds / 60)
+  return minutes < 90 ? `${minutes} min` : `${Math.round(minutes / 60)} h`
+}
+
+// Sessions that worked in this scope and are gone, newest first.
+export const trailFor = (records: readonly SessionRecord[], scope: string, liveIds: ReadonlySet<string>): SessionRecord[] =>
+  records
+    .filter(r => scopeOf(r) === scope && !liveIds.has(r.id) && Object.keys(r.touched).length > 0)
+    .sort((a, b) => lastActivity(b) - lastActivity(a))
+
+export const trailBlock = (trail: readonly SessionRecord[], now: number): string =>
+  [
+    '[peer-sessions] Earlier Claude sessions in this repository (most recent first):',
+    ...trail.slice(0, MAX_TRAIL_SHOWN).map(r => {
+      const files = Object.entries(r.touched).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([path]) => path)
+      const extra = Object.keys(r.touched).length - files.length
+      return `- ${agoText(lastActivity(r), now)}, ${r.id.slice(0, 8)}: ${taskOf(r)}\n  wrote: ${files.join(', ')}${extra > 0 ? ` and ${extra} more` : ''}`
+    }),
+    'Their work may be unfinished or uncommitted: check git status before assuming a clean tree. mcp__peer-sessions__history shows more.',
+  ].join('\n')
+
+export type Writer = { record: SessionRecord; at: number }
+
+// Who last wrote `path`, among sessions other than `ownId`, within BLAME_MS.
+export const lastWriter = (records: readonly SessionRecord[], path: string, ownId: string, now: number): Writer | null => {
+  let best: Writer | null = null
+  for (const record of records) {
+    const at = record.touched[path]
+    if (record.id === ownId || at === undefined || now - at > BLAME_MS) continue
+    if (!best || at > best.at) best = { record, at }
+  }
+  return best
+}
+
+export const writersOf = (records: readonly SessionRecord[], path: string): Writer[] =>
+  records
+    .flatMap(record => (record.touched[path] === undefined ? [] : [{ record, at: record.touched[path] as number }]))
+    .sort((a, b) => b.at - a.at)
+
+export type PinnedNote = { note: Note; author: SessionRecord }
+
+export const notesFor = (records: readonly SessionRecord[], scope: string, now: number): PinnedNote[] =>
+  records
+    .flatMap(author => (author.notes ?? []).filter(n => n.scope === scope && n.until >= now).map(note => ({ note, author })))
+    .sort((a, b) => b.note.at - a.note.at)
+    .slice(0, MAX_NOTES)
+
+export const notesBlock = (pinned: readonly PinnedNote[], now: number): string =>
+  [
+    '[peer-sessions] Notes pinned for this repository by Claude sessions:',
+    ...pinned.map(({ note, author }) => `- ${agoText(note.at, now)}, ${author.id.slice(0, 8)}${author.ended ? ' (ended)' : ''}: ${note.text}`),
+  ].join('\n')
+
+export const addNote = (record: SessionRecord, note: Note): SessionRecord => ({
+  ...record,
+  notes: [note, ...(record.notes ?? []).filter(n => n.until >= note.at)].slice(0, MAX_NOTES),
+})
+
+export const removeNotes = (record: SessionRecord, id: string): SessionRecord => ({
+  ...record,
+  notes: id === 'all' ? [] : (record.notes ?? []).filter(n => n.id !== id),
+})
 
 export const releaseClaims = (record: SessionRecord, resources: readonly string[]): SessionRecord => ({
   ...record,

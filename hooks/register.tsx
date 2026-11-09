@@ -10,10 +10,16 @@ import {
   LIVE_MS,
   MAX_CLAIMS,
   MAX_MESSAGE_CHARS,
+  MAX_NOTE_HOURS,
+  MAX_NOTE_TEXT,
+  TRAIL_MS,
   MAX_PEERS_READ,
   MAX_RECORD_BYTES,
   addClaims,
   addMessage,
+  addNote,
+  agoText,
+  durationText,
   branchConflict,
   claimConflict,
   describePeer,
@@ -22,21 +28,29 @@ import {
   gitDir,
   inboxBlock,
   inboxFor,
+  lastWriter,
   intentFrom,
   markSeen,
   newRecord,
   normClaim,
+  notesBlock,
+  notesFor,
   normPath,
   overlappingClaims,
   parseRecord,
   peersBlock,
   racingGitVerb,
   releaseClaims,
+  removeNotes,
   sameCheckout,
+  scopeOf,
   shellWriteTargets,
   statusText,
   taskOf,
   touch,
+  trailBlock,
+  trailFor,
+  writersOf,
   type Message,
   type SessionRecord,
 } from './registry'
@@ -48,6 +62,17 @@ const TASK_ORIGINS = new Set(['composer', 'bridge', 'sdk', 'coordinator', 'sched
 const CLAIM_TOOL = 'mcp__peer-sessions__claim'
 const PEERS_TOOL = 'mcp__peer-sessions__peers'
 const MESSAGE_TOOL = 'mcp__peer-sessions__message'
+const HISTORY_TOOL = 'mcp__peer-sessions__history'
+const PIN_TOOL = 'mcp__peer-sessions__pin'
+const WAIT_TOOL = 'mcp__peer-sessions__wait_for'
+const WAIT_POLL_MS = 5_000
+// A hook has 10 s of its own time and a $.clock wait counts against it: wait_for
+// checks inline this long, then hands the rest to a watch the session timer runs.
+const WAIT_INLINE_MS = 6_000
+const WAIT_INLINE_STEP_MS = 3_000
+const WAIT_MAX_SECONDS = 3_600
+// The 7-day scan behind the trail and blame is re-read at most this often.
+const HISTORY_EVERY_MS = 60_000
 const READ_TOOLS = new Set(['Read', 'NotebookRead'])
 // Reading every peer file on every tool call would cost a disk scan per Grep.
 const INBOX_EVERY_MS = 10_000
@@ -73,6 +98,16 @@ let heartbeat: { cancel: () => void } | null = null
 const readAt = new Map<string, number>()
 let lastInboxCheck: number | null = null
 let sentCount = 0
+let history: { at: number; records: SessionRecord[] } | null = null
+type Watch = { target: string; isSession: boolean; resource: string; since: number; until: number }
+let watches: Watch[] = []
+// Notices for this session itself (a watch that resolved), delivered like messages.
+let notices: string[] = []
+let watcher: { cancel: () => void } | null = null
+// Main-loop turns in flight: a notice waits for the next tool result while one runs, else wakes the session.
+let turnsRunning = 0
+// Files whose earlier writer this session was already told about.
+const blamed = new Set<string>()
 
 // Every session writes only its own file and reads the others', so the
 // registry never has two writers on one file.
@@ -100,6 +135,8 @@ async function ensureOwn($: EngineInterface): Promise<SessionRecord | null> {
   hasBriefed = false
   warned.clear()
   readAt.clear()
+  blamed.clear()
+  history = null
   lastInboxCheck = null
   return own
 }
@@ -153,6 +190,14 @@ async function livePeers($: EngineInterface): Promise<SessionRecord[]> {
   return (await peerRecords($, LIVE_MS)).filter(r => !r.ended)
 }
 
+// Every other session's record from the last 7 days, live or ended: the trail.
+async function recentRecords($: EngineInterface): Promise<SessionRecord[]> {
+  const now = await $.clock.now()
+  if (history && now - history.at < HISTORY_EVERY_MS) return history.records
+  history = { at: now, records: await peerRecords($, TRAIL_MS) }
+  return history.records
+}
+
 function showStatus($: EngineInterface, peers: readonly SessionRecord[]): void {
   const repo = own?.repo ?? null
   $.ui.status(statusText(peers, repo))
@@ -168,8 +213,11 @@ async function beat($: EngineInterface): Promise<void> {
 
 // One check for every way a file gets written (Edit, Write, a shell redirect):
 // refuse once on a peer's recent edit or claim, otherwise record the write.
-async function guardWrites($: EngineInterface, paths: readonly string[], shown: string): Promise<string | null> {
-  if (!paths.length || !(await ensureOwn($)) || !own) return null
+type Verdict = { deny: string | null; info: string | null }
+const CLEAR: Verdict = { deny: null, info: null }
+
+async function guardWrites($: EngineInterface, paths: readonly string[], shown: string): Promise<Verdict> {
+  if (!paths.length || !(await ensureOwn($)) || !own) return CLEAR
   const now = await $.clock.now()
   const peers = await livePeers($)
   for (const path of paths) {
@@ -180,38 +228,58 @@ async function guardWrites($: EngineInterface, paths: readonly string[], shown: 
       warned.add(`edit|${edited.peer.id}|${path}`)
       const minutes = Math.max(0, Math.round((now - edited.touchedAt) / 60_000))
       await handoff($, edited.peer, `I was about to write ${path}, which you edited ${minutes} min ago; I was told to re-read it first. My task: ${own ? taskOf(own) : 'no task typed yet'}.`)
-      return [
+      return { info: null, deny: [
         `[peer-sessions] Session ${edited.peer.id.slice(0, 8)} (${edited.peer.repo ?? edited.peer.cwd}) edited ${path} ${minutes} min ago and is still live.`,
         `It is doing: ${taskOf(edited.peer)}.`,
         'Re-read the file before writing so you do not overwrite its change (that session has been told). If your change overlaps its task, message it (mcp__peer-sessions__message) or ask the user first.',
         `This refusal fires once per file per peer within ${EDIT_CONFLICT_MS / 60_000} min: ${shown} made after re-reading goes through.`,
-      ].join(' ')
+      ].join(' ') }
     }
     const claimed = claimConflict(peers, path)
     if (claimed && !warned.has(`claim|${claimed.peer.id}|${path}`)) {
       warned.add(`claim|${claimed.peer.id}|${path}`)
       await handoff($, claimed.peer, `I was about to write ${path}, inside your claim ${claimed.claim.resource}. My task: ${own ? taskOf(own) : 'no task typed yet'}. Tell me if I should keep out.`)
-      return [
+      return { info: null, deny: [
         `[peer-sessions] ${path} is inside ${claimed.claim.resource}, which live session ${claimed.peer.id.slice(0, 8)} claimed${claimed.claim.note ? ` (${claimed.claim.note})` : ''}.`,
         `It is doing: ${taskOf(claimed.peer)}.`,
         'That session has been told. Ask it (mcp__peer-sessions__message) or the user before changing what it owns. Running the same change again goes through.',
-      ].join(' ')
+      ].join(' ') }
     }
   }
+  const info = await blameNote($, paths, now)
+  if (!own) return CLEAR
   let record = own
   for (const path of paths) record = touch(record, path, now)
   own = record
   await save($)
-  return null
+  return { deny: null, info }
 }
 
-async function checkEdit($: EngineInterface, raw: unknown): Promise<string | null> {
-  if (typeof raw !== 'string' || !(await ensureOwn($)) || !own) return null
+// The first write to a file this session says who wrote it last, if another
+// session did within a day: git blame for Claude sessions.
+async function blameNote($: EngineInterface, paths: readonly string[], now: number): Promise<string | null> {
+  const fresh = paths.filter(path => !blamed.has(path))
+  if (!fresh.length || !own) return null
+  const ownId = own.id
+  const records = await recentRecords($)
+  const lines: string[] = []
+  for (const path of fresh) {
+    blamed.add(path)
+    const writer = lastWriter(records, path, ownId, now)
+    if (!writer) continue
+    const state = writer.record.ended ? 'session since ended' : 'still live'
+    lines.push(`${path} was last written ${agoText(writer.at, now)} by session ${writer.record.id.slice(0, 8)} (${state}), doing: ${taskOf(writer.record)}.`)
+  }
+  return lines.length ? `[peer-sessions] ${lines.join(' ')} If your change builds on or undoes that work, check it first.` : null
+}
+
+async function checkEdit($: EngineInterface, raw: unknown): Promise<Verdict> {
+  if (typeof raw !== 'string' || !(await ensureOwn($)) || !own) return CLEAR
   return guardWrites($, [normPath(raw, own.cwd)], 'the edit')
 }
 
-async function checkShellWrites($: EngineInterface, command: unknown): Promise<string | null> {
-  if (typeof command !== 'string' || !(await ensureOwn($)) || !own) return null
+async function checkShellWrites($: EngineInterface, command: unknown): Promise<Verdict> {
+  if (typeof command !== 'string' || !(await ensureOwn($)) || !own) return CLEAR
   return guardWrites($, shellWriteTargets(command, own.cwd), 'the command')
 }
 
@@ -309,6 +377,13 @@ async function sendMessage($: EngineInterface, input: Record<string, unknown>): 
 
 // Messages for this session, at most every INBOX_EVERY_MS unless forced.
 async function takeInbox($: EngineInterface, isForced: boolean): Promise<string | null> {
+  const selfNotices = notices.length ? `[peer-sessions] ${notices.join(' ')}` : null
+  notices = []
+  const peerMail = await takePeerMail($, isForced)
+  return [selfNotices, peerMail].filter(Boolean).join('\n\n') || null
+}
+
+async function takePeerMail($: EngineInterface, isForced: boolean): Promise<string | null> {
   const now = await $.clock.now()
   if (!isForced && lastInboxCheck !== null && now - lastInboxCheck < INBOX_EVERY_MS) return null
   lastInboxCheck = now
@@ -354,7 +429,140 @@ async function briefing($: EngineInterface, text: string): Promise<string | null
         ? peersBlock('New Claude sessions started since your last prompt:', arrived, now, repo)
         : null
   const inbox = await takeInbox($, true)
-  return [intro, inbox].filter(Boolean).join('\n\n') || null
+  const context = isFirst ? await memoryOfScope($, peers) : await newNotes($)
+  return [intro, context, inbox].filter(Boolean).join('\n\n') || null
+}
+
+const shownNotes = new Set<string>()
+
+// What earlier sessions left in this repository: their trail and pinned notes.
+async function memoryOfScope($: EngineInterface, live: readonly SessionRecord[]): Promise<string | null> {
+  if (!own) return null
+  const now = await $.clock.now()
+  const scope = scopeOf(own)
+  const records = await recentRecords($)
+  const trail = trailFor(records, scope, new Set(live.map(p => p.id)))
+  const pinned = notesFor([own, ...records], scope, now)
+  for (const p of pinned) shownNotes.add(p.note.id)
+  return [trail.length ? trailBlock(trail, now) : null, pinned.length ? notesBlock(pinned, now) : null].filter(Boolean).join('\n\n') || null
+}
+
+async function newNotes($: EngineInterface): Promise<string | null> {
+  if (!own) return null
+  const now = await $.clock.now()
+  const fresh = notesFor(await recentRecords($), scopeOf(own), now).filter(p => !shownNotes.has(p.note.id))
+  for (const p of fresh) shownNotes.add(p.note.id)
+  return fresh.length ? notesBlock(fresh, now) : null
+}
+
+async function pin($: EngineInterface, input: Record<string, unknown>): Promise<string> {
+  if (!(await ensureOwn($)) || !own) return 'peer-sessions: no home directory to keep the registry in.'
+  if (typeof input.unpin === 'string' && input.unpin.trim()) {
+    const id = input.unpin.trim()
+    const had = (own.notes ?? []).length
+    own = removeNotes(own, id)
+    await save($)
+    return had === (own.notes ?? []).length ? `No note of this session has id ${id}.` : id === 'all' ? 'Unpinned every note of this session.' : `Unpinned ${id}.`
+  }
+  const text = typeof input.text === 'string' ? input.text.trim().slice(0, MAX_NOTE_TEXT) : ''
+  if (!text) return 'Nothing pinned: text is empty.'
+  const hours = Math.min(MAX_NOTE_HOURS, Math.max(1, typeof input.hours === 'number' ? input.hours : 24))
+  await refreshCheckout($)
+  if (!own) return 'peer-sessions: the session record was lost.'
+  const now = await $.clock.now()
+  sentCount += 1
+  const note = { id: `n-${own.id.slice(0, 8)}-${sentCount}`, text, at: now, until: now + hours * 3_600_000, scope: scopeOf(own) }
+  own = addNote(own, note)
+  shownNotes.add(note.id)
+  await save($)
+  return `Pinned ${note.id} for ${note.scope} for ${hours} h. Every session that opens there sees it, and live ones get it with their next prompt, even after this session ends.`
+}
+
+async function historyReport($: EngineInterface, input: Record<string, unknown>): Promise<string> {
+  if (!(await ensureOwn($)) || !own) return 'peer-sessions: no home directory to keep the registry in.'
+  await refreshCheckout($)
+  if (!own) return 'peer-sessions: the session record was lost.'
+  const now = await $.clock.now()
+  history = null
+  const records = await recentRecords($)
+  const live = new Set((await livePeers($)).map(p => p.id))
+  if (typeof input.path === 'string' && input.path.trim()) {
+    const path = normPath(input.path.trim(), own.cwd)
+    const writers = writersOf([own, ...records], path).slice(0, 8)
+    if (!writers.length) return `No Claude session wrote ${path} in the last 7 days.`
+    return [
+      `Claude sessions that wrote ${path} (last 7 days, newest first):`,
+      ...writers.map(({ record, at }) => {
+        const state = record.id === own?.id ? 'this session' : live.has(record.id) ? 'live' : 'ended'
+        return `- ${agoText(at, now)}, ${record.id.slice(0, 8)} (${state}): ${taskOf(record)}`
+      }),
+    ].join('\n')
+  }
+  const trail = trailFor(records, scopeOf(own), live)
+  const pinned = notesFor([own, ...records], scopeOf(own), now)
+  const parts = [trail.length ? trailBlock(trail, now) : 'No earlier Claude session wrote files in this repository in the last 7 days.', pinned.length ? notesBlock(pinned, now) : null]
+  return parts.filter(Boolean).join('\n\n')
+}
+
+function describeWatch(watch: Watch): string {
+  return watch.isSession ? `session ${watch.target}` : watch.resource
+}
+
+// Who still stands in the way of a watch, or null once it is clear.
+async function blockerOf($: EngineInterface, watch: Watch): Promise<string | null> {
+  const peers = await livePeers($)
+  if (watch.isSession) {
+    const peer = peers.find(p => p.id.startsWith(watch.target.toLowerCase()))
+    return peer ? `session ${peer.id.slice(0, 8)} is still live, doing: ${taskOf(peer)}` : null
+  }
+  const held = overlappingClaims(peers, [watch.resource])[0]
+  return held ? `${held.claim.resource} is still claimed by ${held.peer.id.slice(0, 8)}${held.claim.note ? ` (${held.claim.note})` : ''}` : null
+}
+
+// Checks inline for a few seconds; if the target is still held, leaves a watch
+// that tells the session the moment it clears, so the model can work meanwhile.
+async function waitFor($: EngineInterface, input: Record<string, unknown>, signal: AbortSignal | undefined): Promise<string> {
+  if (!(await ensureOwn($)) || !own) return 'peer-sessions: no home directory to keep the registry in.'
+  const target = typeof input.target === 'string' ? input.target.trim() : ''
+  if (!target) return 'Nothing to wait for: pass target, a session id (8+ characters) or a claimed resource such as branch:main or src/api/.'
+  const seconds = Math.min(WAIT_MAX_SECONDS, Math.max(5, typeof input.timeoutSeconds === 'number' ? input.timeoutSeconds : 600))
+  const started = await $.clock.now()
+  const isSession = /^[0-9a-f][0-9a-f-]{7,}$/i.test(target)
+  const watch: Watch = { target, isSession, resource: normClaim(target, own.cwd, own.common ?? null), since: started, until: started + seconds * 1000 }
+  let blocker = await blockerOf($, watch)
+  if (!blocker) return isSession ? `Session ${target} is not live: nothing to wait for.` : `Nobody holds ${watch.resource}: go ahead.`
+  // Sleeps count against the hook's 10 s budget: never start one that would cross WAIT_INLINE_MS.
+  while (blocker && (await $.clock.now()) - started + WAIT_INLINE_STEP_MS <= WAIT_INLINE_MS) {
+    await $.clock.sleep(WAIT_INLINE_STEP_MS, signal ? { signal } : undefined)
+    blocker = await blockerOf($, watch)
+  }
+  const took = Math.round(((await $.clock.now()) - started) / 1000)
+  if (!blocker) return isSession ? `Session ${target} ended after ${took} s of waiting.` : `${watch.resource} was released after ${took} s of waiting: go ahead.`
+  watches = [...watches.filter(w => w.resource !== watch.resource || w.target !== watch.target), watch]
+  return `Still held: ${blocker}. Watching it for up to ${Math.round(seconds / 60)} min: you will get a message the moment it clears. Carry on with other work meanwhile, or end your turn; an idle session is woken.`
+}
+
+// Runs on the session timer: resolves watches and delivers the result.
+async function checkWatches($: EngineInterface): Promise<void> {
+  if (!watches.length) return
+  const now = await $.clock.now()
+  const done: string[] = []
+  const keep: Watch[] = []
+  for (const watch of watches) {
+    const blocker = await blockerOf($, watch)
+    const waited = durationText(now - watch.since)
+    if (!blocker) done.push(`${describeWatch(watch)} ${watch.isSession ? 'has ended' : 'was released'} after ${waited} of waiting: go ahead.`)
+    else if (now >= watch.until) done.push(`Stopped watching ${describeWatch(watch)} after ${waited}: ${blocker}.`)
+    else keep.push(watch)
+  }
+  watches = keep
+  if (!done.length) return
+  $.ui.toast(`peer-sessions: ${done[0]}`)
+  if (turnsRunning > 0) {
+    notices = [...notices, ...done]
+    return
+  }
+  await $.prompt.submit({ text: `[peer-sessions] ${done.join(' ')}` })
 }
 
 async function peersReport($: EngineInterface): Promise<string> {
@@ -376,6 +584,9 @@ const COMMAND_HELP = [
   '/peer-sessions msg <id|all> <text>  send a message (it reaches them with their next tool result or prompt)',
   '/peer-sessions claim <what> [...]   claim files, folders, branch:<name>, port:<n> for this session',
   '/peer-sessions release [<what> ...] give claims back (all of them with no argument)',
+  '/peer-sessions history [<file>]     earlier sessions in this repository, or who wrote a file',
+  '/peer-sessions pin <text>           pin a note for this repository for 24 h (everyone working here sees it)',
+  '/peer-sessions unpin <id|all>       remove a note this session pinned',
   '/peer-sessions help                 this list',
 ].join('\n')
 
@@ -395,6 +606,12 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
       return claim($, { resources: rest, note: 'claimed by the user' })
     case 'release':
       return claim($, { resources: rest, release: true })
+    case 'history':
+      return historyReport($, { path: rest.join(' ') })
+    case 'pin':
+      return pin($, { text: rest.join(' ') })
+    case 'unpin':
+      return pin($, { unpin: rest[0] ?? 'all' })
     case 'help':
       return COMMAND_HELP
     default:
@@ -405,6 +622,9 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
 async function endOwn($: EngineInterface, sessionId: string): Promise<void> {
   heartbeat?.cancel()
   heartbeat = null
+  watcher?.cancel()
+  watcher = null
+  watches = []
   if (own && own.id === sessionId) {
     own = { ...own, ended: true, claims: [] }
     await save($)
@@ -447,6 +667,42 @@ async function registerSurface($: EngineInterface): Promise<void> {
     isDeferred: false,
   })
   await $.tool.register({
+    name: 'history',
+    description:
+      'What earlier Claude sessions did in this repository over the last 7 days: their tasks and the files they wrote, plus pinned notes. ' +
+      'With path: which sessions wrote that file, newest first. Use it before reworking code another session touched.',
+    inputSchema: { type: 'object', properties: { path: { type: 'string', maxLength: 500 } } },
+  })
+  await $.tool.register({
+    name: 'pin',
+    description:
+      'Pin a note for every Claude session that works in this repository, for `hours` (default 24, at most 168). It outlasts this session: ' +
+      'use it for what the next session must know (a rotated credential, a broken test to leave alone, a migration in progress). unpin: a note id, or "all".',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', maxLength: MAX_NOTE_TEXT },
+        hours: { type: 'number', minimum: 1, maximum: MAX_NOTE_HOURS },
+        unpin: { type: 'string', maxLength: 80 },
+      },
+    },
+  })
+  await $.tool.register({
+    name: 'wait_for',
+    description:
+      'Wait until a peer session ends or gives back a claim, instead of racing it. target: a session id (8+ characters) or a claimed resource ' +
+      '(branch:main, port:3000, a file or folder). Checks for a few seconds; if still held, watches it and messages you the moment it clears ' +
+      '(waking the session if idle), so you can do other work meanwhile. timeoutSeconds: how long to watch, 5 to 3600, default 600.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: { type: 'string', maxLength: 300 },
+        timeoutSeconds: { type: 'number', minimum: 5, maximum: WAIT_MAX_SECONDS },
+      },
+      required: ['target'],
+    },
+  })
+  await $.tool.register({
     name: 'peers',
     description: 'List the other live Claude sessions on this machine: folder, git checkout and branch, task, recent edits and claims.',
     inputSchema: { type: 'object', properties: {} },
@@ -467,6 +723,10 @@ export const register: Register = (on, options) => {
       heartbeat?.cancel()
       heartbeat = $.clock.every(HEARTBEAT_MS, () => {
         beat($).catch(() => undefined)
+      })
+      watcher?.cancel()
+      watcher = $.clock.every(WAIT_POLL_MS, () => {
+        checkWatches($).catch(() => undefined)
       })
     } catch {
       // Coordination is advisory: a failure here must never stop a session.
@@ -495,6 +755,18 @@ export const register: Register = (on, options) => {
     result: await sendMessage($, e as unknown as Record<string, unknown>).catch(error => `peer-sessions: message failed (${String(error)}).`),
   })).catch(() => ({ result: 'peer-sessions: message failed; nothing was sent.' }))
 
+  on('tool.call', { tool: HISTORY_TOOL }, async ($, e) => ({
+    result: await historyReport($, e as unknown as Record<string, unknown>).catch(error => `peer-sessions: history failed (${String(error)}).`),
+  })).catch(() => ({ result: 'peer-sessions: history failed.' }))
+
+  on('tool.call', { tool: PIN_TOOL }, async ($, e) => ({
+    result: await pin($, e as unknown as Record<string, unknown>).catch(error => `peer-sessions: pin failed (${String(error)}).`),
+  })).catch(() => ({ result: 'peer-sessions: pin failed; nothing was pinned.' }))
+
+  on('tool.call', { tool: WAIT_TOOL }, async ($, e, next) => ({
+    result: await waitFor($, e as unknown as Record<string, unknown>, next.signal).catch(error => `peer-sessions: wait ended early (${String(error)}).`),
+  })).catch(() => ({ result: 'peer-sessions: wait ended early.' }))
+
   on('tool.call', { tool: PEERS_TOOL }, async $ => ({
     result: await peersReport($).catch(error => `peer-sessions: could not read the registry (${String(error)}).`),
   })).catch(() => ({ result: 'peer-sessions: could not read the registry.' }))
@@ -502,10 +774,11 @@ export const register: Register = (on, options) => {
   on('tool.call', async ($, e, next) => {
     const input = e as unknown as Record<string, unknown>
     let deny: string | null = null
-    if (EDIT_TOOLS.has(e.tool)) deny = await checkEdit($, input.file_path ?? input.notebook_path).catch(() => null)
+    let info: string | null = null
+    if (EDIT_TOOLS.has(e.tool)) ({ deny, info } = await checkEdit($, input.file_path ?? input.notebook_path).catch(() => CLEAR))
     else if (SHELL_TOOLS.has(e.tool)) {
       deny = await checkGit($, input.command).catch(() => null)
-      deny ??= await checkShellWrites($, input.command).catch(() => null)
+      if (!deny) ({ deny, info } = await checkShellWrites($, input.command).catch(() => CLEAR))
     }
     if (deny) $.ui.toast(`peer-sessions: ${mode === 'warn' ? 'warned about' : 'held back'} ${e.tool}: ${deny.replace('[peer-sessions] ', '').slice(0, 180)}`)
     if (deny && mode === 'refuse') return { deny }
@@ -518,7 +791,8 @@ export const register: Register = (on, options) => {
     if (ran.isError) return ran
     if (READ_TOOLS.has(e.tool)) await noteRead($, input.file_path ?? input.notebook_path).catch(() => undefined)
     const inbox = await takeInbox($, false).catch(() => null)
-    return inbox ? { ...ran, context: [...(ran.context ?? []), inbox] } : ran
+    const extra = [info, inbox].filter((x): x is string => Boolean(x))
+    return extra.length ? { ...ran, context: [...(ran.context ?? []), ...extra] } : ran
   // next is replay-safe here: after the tool ran it hands back that result, never a second run.
   }).catch(($, e, next) => next(e))
 
@@ -554,6 +828,16 @@ export const register: Register = (on, options) => {
         )}
       </Box>
     )
+  })
+
+  on('turn.start', async ($, e, next) => {
+    if (e.agentId === undefined) turnsRunning += 1
+    return next(e)
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    if (e.agentId === undefined) turnsRunning = Math.max(0, turnsRunning - 1)
+    return next(e)
   })
 
   on('session.end', async ($, e, next) => {
