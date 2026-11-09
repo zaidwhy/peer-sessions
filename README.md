@@ -103,7 +103,7 @@ In `/config`, under peer-sessions:
 - **Liveness:** a heartbeat rewrites the file every 60 seconds; a file older than about 3 minutes counts as gone, so a crashed session drops out by itself. A session that ends writes a tombstone.
 - **Opinion: hold back once, never lock.** A lock that outlives a crashed session blocks real work, and a warning nobody has to act on gets skipped. One hold-back per peer and target, carrying the peer's task, gives the model what it needs to re-read and coordinate, then gets out of the way.
 - **Fails open:** if the registry cannot be read or written, every tool call and prompt goes on as if the plugin were not installed.
-- **Runs inside Claude Code:** a function-hooks module, no Python, Node or server. Built and tested on Claude Code 2.1.319.
+- **Runs inside Claude Code:** a function-hooks module, no Python, Node or server. Needs Claude Code **2.1.289 or newer**: earlier builds do not load function-hooks modules (checked with `claude plugin validate` on every release from 2.1.288 to 2.1.319). Tested end to end on 2.1.319. Check yours with `claude --version`.
 
 ## Install
 
@@ -155,6 +155,12 @@ claude plugin test .
 - **0.3.0:** sessions message each other (`message` tool, delivered with the next tool result); every refusal is handed to the peer it was about; branch claims across worktrees; no refusal when the file was read after the peer's edit; prompts from `claude -p`, Remote Control, coordinators and `/loop` count as the task.
 - **0.2.0:** claims for files, folders and named resources; a `peers` tool; shell writes guarded; git checks follow `git -C` and a leading `cd`.
 - **0.1.0:** registry with heartbeat, peer briefing, edit and git refusals, `/peer-sessions`, status line.
+
+## Issues, ideas and pull requests
+
+Something wrong, noisy or missing? [Open an issue](https://github.com/zaidwhy/peer-sessions/issues): a hold-back that should not have happened, a collision it missed, a message that never arrived, or an idea for how sessions should work together. The most useful reports say your Claude Code version (`claude --version`), your OS, and what each session was doing.
+
+Pull requests are welcome and I am happy to merge them. Before opening one, run `claude plugin validate .` and `claude plugin test .`, and add a test in `tests/peer-sessions.test.tsx` that fails without your change. Rules live in `hooks/registry.ts` as plain functions, so most fixes start and end there.
 
 ## License
 
