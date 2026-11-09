@@ -1,6 +1,6 @@
 {
   "name": "peer-sessions",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Parallel Claude Code sessions on one machine see each other: who is live, in which repo and branch, doing what, editing which files. Refuses once before an edit or a git commit/push that would race a live peer.",
   "author": { "name": "Zaid Ali Syed" },
   "license": "MIT",

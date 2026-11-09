@@ -21,6 +21,14 @@ const MAX_SHELL_TARGETS = 10
 // named resource such as port:3000 or db:local. It lasts while the session is live.
 export type Claim = { resource: string; note: string; at: number }
 
+// A message lives in its sender's own file (no session writes another's) until
+// it expires; each receiver remembers which ids it has already been shown.
+export type Message = { id: string; to: string; text: string; at: number }
+export const MESSAGE_TTL_MS = 30 * 60_000
+export const MAX_OUTBOX = 20
+export const MAX_SEEN = 200
+export const MAX_MESSAGE_CHARS = 600
+
 export type SessionRecord = {
   shape: number
   id: string
@@ -32,6 +40,10 @@ export type SessionRecord = {
   touched: Record<string, number>
   // Optional so a 0.1.0 session's record still reads as a peer.
   claims?: Claim[]
+  // The repository's shared git dir: one value for every worktree of a repo.
+  common?: string | null
+  outbox?: Message[]
+  seen?: string[]
   ended?: boolean
 }
 
@@ -184,6 +196,67 @@ export const addClaims = (record: SessionRecord, resources: readonly string[], n
   return { ...record, claims: [...added, ...kept].slice(0, MAX_CLAIMS) }
 }
 
+// branch:main means main of this repository, across all its worktrees, so it is
+// stored against the shared git dir: branch:main@c:/work/app/.git.
+export const branchClaim = (branch: string, common: string) => `branch:${branch.toLowerCase()}@${common}`
+
+export const normClaim = (resource: string, cwd: string, common: string | null): string => {
+  const branch = /^branch:([^@\s]+)$/i.exec(resource.trim())
+  return branch?.[1] && common ? branchClaim(branch[1], common) : normResource(resource, cwd)
+}
+
+// The branch a racing git command lands on: an explicit `git push <remote> <src>[:dst]`
+// names it, anything else acts on the checked-out branch.
+export const gitBranch = (command: string, current: string | null): string | null => {
+  const push = /\bgit\s+(?:-C\s+\S+\s+)?push\s+(?:-\S+\s+)*[^\s-]\S*\s+\+?([^\s:;&|]+)(?::([^\s;&|]+))?/.exec(command)
+  return push ? (push[2] ?? push[1] ?? current) : current
+}
+
+export const branchConflict = (peers: readonly SessionRecord[], branch: string, common: string): ClaimConflict | null => {
+  const wanted = branchClaim(branch, common)
+  for (const peer of peers) {
+    const claim = (peer.claims ?? []).find(c => c.resource === wanted)
+    if (claim) return { peer, claim }
+  }
+  return null
+}
+
+export const addMessage = (record: SessionRecord, message: Message): SessionRecord => ({
+  ...record,
+  outbox: [message, ...(record.outbox ?? []).filter(m => message.at - m.at <= MESSAGE_TTL_MS)].slice(0, MAX_OUTBOX),
+})
+
+export type Delivery = { from: SessionRecord; message: Message }
+
+// Messages for this session that it has not been shown: addressed to it by an
+// id prefix of at least 8 characters, or to "all".
+export const inboxFor = (peers: readonly SessionRecord[], own: SessionRecord, now: number): Delivery[] => {
+  const seen = new Set(own.seen ?? [])
+  return peers.flatMap(from =>
+    (from.outbox ?? [])
+      // A broadcast sent before this session started still matters ("deploying staging"): only expiry drops it.
+      .filter(m => !seen.has(m.id) && now - m.at <= MESSAGE_TTL_MS)
+      .filter(m => m.to === 'all' || (m.to.length >= 8 && own.id.startsWith(m.to)))
+      .map(message => ({ from, message })),
+  ).sort((a, b) => a.message.at - b.message.at)
+}
+
+export const markSeen = (record: SessionRecord, ids: readonly string[]): SessionRecord => ({
+  ...record,
+  seen: [...ids, ...(record.seen ?? [])].slice(0, MAX_SEEN),
+})
+
+export const inboxBlock = (deliveries: readonly Delivery[], now: number): string =>
+  [
+    '[peer-sessions] Messages from other Claude sessions on this machine:',
+    ...deliveries.map(({ from, message }) => {
+      const minutes = Math.max(0, Math.round((now - message.at) / 60_000))
+      const where = `${from.repo ?? from.cwd}${from.ended ? ', session since ended' : ''}`
+      return `- from ${from.id.slice(0, 8)} (${where}, doing: ${from.intent || 'no task typed yet'}), ${minutes === 0 ? 'just now' : `${minutes} min ago`}${message.to === 'all' ? ', to all' : ''}: ${message.text}`
+    }),
+    'Reply with the mcp__peer-sessions__message tool (to: the sender id) if it needs an answer, and tell the user if it changes their task.',
+  ].join('\n')
+
 export const releaseClaims = (record: SessionRecord, resources: readonly string[]): SessionRecord => ({
   ...record,
   claims: resources.length ? (record.claims ?? []).filter(c => !resources.includes(c.resource)) : [],
@@ -211,8 +284,8 @@ export const describePeer = (peer: SessionRecord, now: number, ownRepo: string |
 export const PEER_GUIDANCE = [
   'A peer in the same checkout or the same files can be overwritten by you, or can commit or push your half-done work.',
   'Before touching what a peer touched or claimed: re-read the file, prefer your own branch or git worktree, and git fetch before any push.',
-  'Claim the files, folders or resources (port:3000, db:local) you are about to work on with the mcp__peer-sessions__claim tool, so peers are warned off them.',
-  'If your task overlaps a peer\'s, tell it what you are about to change (ListAgents finds it, SendMessage reaches it) or ask the user which session owns the work.',
+  'Claim the files, folders, branches (branch:main) or resources (port:3000, db:local) you are about to work on with the mcp__peer-sessions__claim tool, so peers are warned off them.',
+  'If your task overlaps a peer\'s, tell it what you are about to change with the mcp__peer-sessions__message tool (to: its 8-character id) or ask the user which session owns the work.',
   'mcp__peer-sessions__peers or /peer-sessions shows the current list.',
 ].join(' ')
 

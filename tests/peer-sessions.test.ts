@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { gitDir, intentFrom, normPath, normResource, racingGitVerb, shellWriteTargets, SHAPE } from '../hooks/registry'
+import { gitBranch, gitDir, intentFrom, normPath, normResource, racingGitVerb, shellWriteTargets, SHAPE } from '../hooks/registry'
 
 const HOME = 'C:/Users/dev'
 const DIR = `${HOME}/.claude/peer-sessions`
@@ -38,7 +38,7 @@ function world(on: On, options: { repo?: string | null; isDiskBroken?: boolean }
     const top = dir.startsWith('c:/work/other') ? 'C:/work/other' : repo
     return {
       value: top
-        ? { exitCode: 0, stdout: `${top}\nmain\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+        ? { exitCode: 0, stdout: `${top}\nmain\n${top}/.git\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
         : { exitCode: 128, stdout: '', stderr: 'not a git repository', isStdoutTruncated: false, isStderrTruncated: false },
     }
   })
@@ -348,4 +348,165 @@ test('the peers tool lists peers with their claims, and this session\'s own', as
   const text = JSON.stringify(await $.tool.call({ tool: 'mcp__peer-sessions__peers' }))
   expect(text).toContain('claims: db:local (migrations)')
   expect(text).toContain('This session claims: c:/work/app/src/billing')
+})
+
+type Out = { id: string; to: string; text: string; at: number }
+const contextOf = (ran: unknown) => ((ran as { context?: string[] }).context ?? []).join('\n')
+
+test('the branch a racing git command lands on', () => {
+  expect(gitBranch('git push origin feature:main', 'feature')).toBe('main')
+  expect(gitBranch('git push -u origin feat', 'main')).toBe('feat')
+  expect(gitBranch('git push', 'dev')).toBe('dev')
+  expect(gitBranch('git commit -m x', 'dev')).toBe('dev')
+})
+
+test('a refusal is handed to the peer it was about', async ($, on) => {
+  const w = world(on)
+  w.seedPeer()
+  await $.session.start(start)
+
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/work/app/src/invoice.py', old_string: 'a', new_string: 'b' })
+  const outbox: Out[] = w.ownRecord().outbox
+  expect(outbox.length).toBe(1)
+  expect(outbox[0]?.to).toBe(PEER_ID)
+  expect(outbox[0]?.text).toContain('[automatic] I was about to write c:/work/app/src/invoice.py')
+})
+
+test('a message for this session arrives with the next tool result, once', async ($, on) => {
+  const w = world(on)
+  await $.session.start(start)
+  w.seedPeer({ outbox: [{ id: 'm1', to: 'aaaaaaaa', text: 'hold off src/billing, mid-migration', at: w.clock.now() }] })
+
+  const first = await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect(contextOf(first)).toContain('from bbbbbbbb')
+  expect(contextOf(first)).toContain('hold off src/billing, mid-migration')
+  expect(w.ownRecord().seen).toEqual(['m1'])
+
+  await w.clock.advance(11_000)
+  const second = await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect(contextOf(second)).toBe('')
+})
+
+test('messages to all arrive, recent ones from before this session too; ones for others or expired do not', async ($, on) => {
+  const w = world(on)
+  await w.clock.set(40 * 60_000)
+  await $.session.start(start)
+  const now = w.clock.now()
+  w.seedPeer({
+    outbox: [
+      { id: 'all1', to: 'all', text: 'deploying staging now', at: now },
+      { id: 'other', to: 'cccccccc', text: 'not for you', at: now },
+      { id: 'early', to: 'all', text: 'sent before you started', at: now - 60_000 },
+      { id: 'old', to: 'all', text: 'long expired', at: now - 31 * 60_000 },
+    ],
+  })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect(contextOf(ran)).toContain('deploying staging now')
+  expect(contextOf(ran)).not.toContain('not for you')
+  expect(contextOf(ran)).toContain('sent before you started')
+  expect(contextOf(ran)).not.toContain('long expired')
+})
+
+test('the typed prompt carries unread messages', async ($, on) => {
+  const w = world(on)
+  await $.session.start(start)
+  w.seedPeer({ outbox: [{ id: 'm2', to: 'aaaaaaaa', text: 'I pushed main, pull before you commit', at: w.clock.now() }] })
+
+  const prompt = await $.prompt.submit(typed('add rate limiting to the upload endpoint'))
+  expect(prompt.context?.join('\n')).toContain('I pushed main, pull before you commit')
+})
+
+test('the message tool sends to one live peer or all, and refuses unknown ids', async ($, on) => {
+  const w = world(on)
+  w.seedPeer()
+  await $.session.start(start)
+
+  expect(JSON.stringify(await $.tool.call({ tool: 'mcp__peer-sessions__message', to: 'bbbbbbbb', text: 'taking src/api' }))).toContain('Sent to session bbbbbbbb')
+  expect(JSON.stringify(await $.tool.call({ tool: 'mcp__peer-sessions__message', to: 'zzzzzzzz', text: 'hi' }))).toContain('no live session id starts with zzzzzzzz')
+  expect(JSON.stringify(await $.tool.call({ tool: 'mcp__peer-sessions__message', to: 'bb', text: 'hi' }))).toContain('at least 8 characters')
+  await $.tool.call({ tool: 'mcp__peer-sessions__message', to: 'all', text: 'running migrations' })
+
+  const outbox: Out[] = w.ownRecord().outbox
+  expect(outbox.map(m => [m.to, m.text])).toEqual([['all', 'running migrations'], ['bbbbbbbb', 'taking src/api']])
+})
+
+test('reading the file after the peer edited it means no refusal', async ($, on) => {
+  const w = world(on)
+  w.seedPeer()
+  await $.session.start(start)
+  await w.clock.advance(1_000)
+
+  await $.tool.call({ tool: 'Read', file_path: 'C:/work/app/src/invoice.py' })
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/work/app/src/invoice.py', old_string: 'a', new_string: 'b' })
+  expect(w.ranTools).toEqual(['Read', 'Edit'])
+})
+
+test('a read from before the peer edit still gets the refusal', async ($, on) => {
+  const w = world(on)
+  await $.session.start(start)
+  await $.tool.call({ tool: 'Read', file_path: 'C:/work/app/src/invoice.py' })
+  await w.clock.advance(1_000)
+  w.seedPeer()
+
+  const refused = await $.tool.call({ tool: 'Edit', file_path: 'C:/work/app/src/invoice.py', old_string: 'a', new_string: 'b' })
+  expect(JSON.stringify(refused)).toContain('refactor the invoice parser')
+  expect(w.ranTools).toEqual(['Read'])
+})
+
+test('a branch a peer claimed from another worktree refuses a push to it, not a checkout', async ($, on) => {
+  const w = world(on)
+  w.seedPeer({ repo: 'c:/work/app-wt', cwd: 'c:/work/app-wt', claims: [{ resource: 'branch:main@c:/work/app/.git', note: 'release cut', at: 0 }] })
+  await $.session.start(start)
+
+  const refused = await $.tool.call({ tool: 'Bash', command: 'git push origin main' })
+  expect(JSON.stringify(refused)).toContain('Branch main of this repository is claimed')
+  expect(JSON.stringify(refused)).toContain('release cut')
+
+  await $.tool.call({ tool: 'Bash', command: 'git checkout main' })
+  await $.tool.call({ tool: 'Bash', command: 'git push origin main' })
+  expect(w.ranTools).toEqual(['Bash', 'Bash'])
+})
+
+test('claiming branch:main ties it to this repository', async ($, on) => {
+  const w = world(on)
+  await $.session.start(start)
+
+  await $.tool.call({ tool: 'mcp__peer-sessions__claim', resources: ['branch:main'], note: 'release' })
+  expect(w.ownRecord().claims.map((c: { resource: string }) => c.resource)).toEqual(['branch:main@c:/work/app/.git'])
+})
+
+test('a headless (-p) or phone prompt is the task; a peer delivery is not', async ($, on) => {
+  const w = world(on)
+  await $.session.start(start)
+
+  await $.prompt.submit({ text: 'summarise the failing CI jobs on main', origin: { kind: 'sdk' } as never, wait: false })
+  expect(w.ownRecord().intent).toBe('summarise the failing CI jobs on main')
+
+  await $.prompt.submit({ text: 'Another Claude session sent a message: please stop editing', origin: { kind: 'peer' } as never, wait: false })
+  expect(w.ownRecord().intent).toBe('summarise the failing CI jobs on main')
+})
+
+test('a notification prompt carries the inbox without becoming the task', async ($, on) => {
+  const w = world(on)
+  await $.session.start(start)
+  await $.prompt.submit(typed('add rate limiting to the upload endpoint'))
+  w.seedPeer({ outbox: [{ id: 'm3', to: 'aaaaaaaa', text: 'PONG from B', at: w.clock.now() }] })
+
+  const woke = await $.prompt.submit({ text: '<task-notification> background job finished', origin: { kind: 'task-notification' } as never, wait: false })
+  expect(woke.context?.join('\n')).toContain('PONG from B')
+  expect(w.ownRecord().intent).toBe('add rate limiting to the upload endpoint')
+})
+
+test('a message from a session that has since ended still arrives, marked as ended', async ($, on) => {
+  const w = world(on)
+  await $.session.start(start)
+  w.seedPeer({ ended: true, outbox: [{ id: 'm4', to: 'aaaaaaaa', text: 'I pushed main, pull before you commit', at: w.clock.now() }] })
+  await w.clock.advance(5 * 60_000)
+  w.files.set(`${DIR}/${PEER_ID}.json`, { ...w.files.get(`${DIR}/${PEER_ID}.json`)!, mtimeMs: w.clock.now() - 4 * 60_000 })
+
+  const ran = await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect(contextOf(ran)).toContain('I pushed main, pull before you commit')
+  expect(contextOf(ran)).toContain('session since ended')
+  expect(JSON.stringify(await $.tool.call({ tool: 'mcp__peer-sessions__peers' }))).toContain('No other live Claude sessions')
 })
