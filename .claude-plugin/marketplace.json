@@ -1,0 +1,6 @@
+{
+  "name": "peer-sessions",
+  "owner": { "name": "Zaid Ali Syed" },
+  "description": "peer-sessions: parallel Claude Code sessions on one machine see each other and stop once before racing a peer's edit or git command.",
+  "plugins": [{ "name": "peer-sessions", "source": "./" }]
+}
