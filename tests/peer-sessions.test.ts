@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { normPath, racingGitVerb, intentFrom, SHAPE } from '../hooks/registry'
+import { gitDir, intentFrom, normPath, normResource, racingGitVerb, shellWriteTargets, SHAPE } from '../hooks/registry'
 
 const HOME = 'C:/Users/dev'
 const DIR = `${HOME}/.claude/peer-sessions`
@@ -31,11 +31,17 @@ function world(on: On, options: { repo?: string | null; isDiskBroken?: boolean }
     statuses.push(e.text)
     return { value: undefined }
   })
-  on('process.run', () => ({
-    value: repo
-      ? { exitCode: 0, stdout: `${repo}\nmain\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
-      : { exitCode: 128, stdout: '', stderr: 'not a git repository', isStdoutTruncated: false, isStderrTruncated: false },
-  }))
+  on('tool.register', (_, e) => ({ value: { tool: `mcp__peer-sessions__${e.name}` } }))
+  // The session's folder is the repo `repo`; C:/work/other is a second repo a `git -C` can reach.
+  on('process.run', (_, e) => {
+    const dir = key(e.init?.cwd ?? '').toLowerCase()
+    const top = dir.startsWith('c:/work/other') ? 'C:/work/other' : repo
+    return {
+      value: top
+        ? { exitCode: 0, stdout: `${top}\nmain\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+        : { exitCode: 128, stdout: '', stderr: 'not a git repository', isStdoutTruncated: false, isStderrTruncated: false },
+    }
+  })
   on('fs.write', (_, e) => {
     if (options.isDiskBroken) return { deny: 'disk gone' }
     files.set(key(e.path), { text: e.text, mtimeMs: clock.now() })
@@ -193,7 +199,7 @@ test('git commit in a checkout a live peer shares is refused once; git status is
   expect(w.ranTools).toEqual(['Bash'])
 
   const refused = await $.tool.call({ tool: 'Bash', command: 'git add -A && git commit -m "wip"' })
-  expect(JSON.stringify(refused)).toContain('same checkout')
+  expect(JSON.stringify(refused)).toContain('checkout this git commit acts on')
   expect(w.ranTools).toEqual(['Bash'])
 
   await $.tool.call({ tool: 'Bash', command: 'git add -A && git commit -m "wip"' })
@@ -249,4 +255,97 @@ test('/peer-sessions lists live peers', async ($, on) => {
   const ran = await $.command.run({ command: 'peer-sessions', args: '', origin: { kind: 'composer' } } as never)
   expect(ran.text).toContain('1 other live session(s):')
   expect(ran.text).toContain('refactor the invoice parser')
+})
+
+const CWD = 'C:/work/app'
+
+test('shell writes are read from redirects, tee, sed -i and PowerShell content cmdlets', () => {
+  expect(shellWriteTargets('npm test >> logs/run.log 2>&1', CWD)).toEqual(['c:/work/app/logs/run.log'])
+  expect(shellWriteTargets("cd ../lib && sed -i 's/a/b/' x.py y.py", CWD)).toEqual(['c:/work/lib/x.py', 'c:/work/lib/y.py'])
+  expect(shellWriteTargets('make 2>&1 | tee -a "build out.txt"', CWD)).toEqual(['c:/work/app/build out.txt'])
+  expect(shellWriteTargets('Add-Content -Path notes.md -Value done', CWD)).toEqual(['c:/work/app/notes.md'])
+  expect(shellWriteTargets('echo hi > /dev/null; ls 2>/dev/null; echo $x > $target', CWD)).toEqual([])
+  expect(shellWriteTargets('git log --oneline -5', CWD)).toEqual([])
+})
+
+test('git targets the folder -C or a leading cd names', () => {
+  expect(gitDir('git -C ../other commit -m x', CWD)).toBe('c:/work/other')
+  expect(gitDir('cd "C:/work/other" && git push', CWD)).toBe('c:/work/other')
+  expect(gitDir('git push', CWD)).toBe('c:/work/app')
+})
+
+test('claims are paths when they look like paths, names otherwise', () => {
+  expect(normResource('src\\api\\', CWD)).toBe('c:/work/app/src/api')
+  expect(normResource('README.md', CWD)).toBe('c:/work/app/readme.md')
+  expect(normResource('Port:3000', CWD)).toBe('port:3000')
+  expect(normResource('localhost:3000', CWD)).toBe('localhost:3000')
+})
+
+test('a shell append to a file a live peer just edited is refused once', async ($, on) => {
+  const w = world(on)
+  w.seedPeer()
+  await $.session.start(start)
+
+  const refused = await $.tool.call({ tool: 'Bash', command: 'echo "# note" >> src/invoice.py' })
+  expect(JSON.stringify(refused)).toContain('refactor the invoice parser')
+  expect(w.ranTools).toEqual([])
+
+  await $.tool.call({ tool: 'Bash', command: 'echo "# note" >> src/invoice.py' })
+  expect(w.ranTools).toEqual(['Bash'])
+  expect(Object.keys(w.ownRecord().touched)).toContain('c:/work/app/src/invoice.py')
+})
+
+test('editing inside a folder a live peer claimed is refused once, naming the claim', async ($, on) => {
+  const w = world(on)
+  w.seedPeer({ touched: {}, claims: [{ resource: 'c:/work/app/src/api', note: 'auth rewrite', at: 0 }] })
+  await $.session.start(start)
+
+  const refused = await $.tool.call({ tool: 'Write', file_path: 'C:/work/app/src/api/routes.py', content: 'x' })
+  expect(JSON.stringify(refused)).toContain('auth rewrite')
+  expect(w.ranTools).toEqual([])
+
+  await $.tool.call({ tool: 'Write', file_path: 'C:/work/app/src/api/routes.py', content: 'x' })
+  await $.tool.call({ tool: 'Write', file_path: 'C:/work/app/src/apiary.py', content: 'x' })
+  expect(w.ranTools).toEqual(['Write', 'Write'])
+})
+
+test('the claim tool records claims and reports overlaps with peers', async ($, on) => {
+  const w = world(on)
+  w.seedPeer({ claims: [{ resource: 'port:3000', note: 'dev server', at: 0 }] })
+  await $.session.start(start)
+
+  const ran = await $.tool.call({ tool: 'mcp__peer-sessions__claim', resources: ['src/', 'Port:3000'], note: 'billing work' })
+  const text = JSON.stringify(ran)
+  expect(text).toContain('port:3000 is held by bbbbbbbb (dev server)')
+  expect(w.ownRecord().claims.map((c: { resource: string }) => c.resource)).toEqual(['c:/work/app/src', 'port:3000'])
+
+  await $.tool.call({ tool: 'mcp__peer-sessions__claim', resources: ['port:3000'], release: true })
+  expect(w.ownRecord().claims.map((c: { resource: string }) => c.resource)).toEqual(['c:/work/app/src'])
+
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: OWN_ID, resume: {} as never })
+  expect(w.ownRecord().claims).toEqual([])
+})
+
+test('git -C into a checkout a live peer shares is refused even from outside any repo', async ($, on) => {
+  const w = world(on, { repo: null })
+  w.seedPeer({ repo: 'c:/work/other', cwd: 'c:/work/other' })
+  await $.session.start(start)
+
+  await $.tool.call({ tool: 'Bash', command: 'git commit -m x' })
+  expect(w.ranTools).toEqual(['Bash'])
+
+  const refused = await $.tool.call({ tool: 'Bash', command: 'git -C C:/work/other push' })
+  expect(JSON.stringify(refused)).toContain('c:/work/other')
+  expect(w.ranTools).toEqual(['Bash'])
+})
+
+test('the peers tool lists peers with their claims, and this session\'s own', async ($, on) => {
+  const w = world(on)
+  w.seedPeer({ claims: [{ resource: 'db:local', note: 'migrations', at: 0 }] })
+  await $.session.start(start)
+  await $.tool.call({ tool: 'mcp__peer-sessions__claim', resources: ['src/billing/'] })
+
+  const text = JSON.stringify(await $.tool.call({ tool: 'mcp__peer-sessions__peers' }))
+  expect(text).toContain('claims: db:local (migrations)')
+  expect(text).toContain('This session claims: c:/work/app/src/billing')
 })

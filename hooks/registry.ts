@@ -12,6 +12,14 @@ export const MAX_INTENT_CHARS = 160
 export const MIN_INTENT_CHARS = 20
 export const MAX_RECORD_BYTES = 64 * 1024
 export const MAX_PEERS_READ = 50
+export const MAX_CLAIMS = 20
+export const MAX_RESOURCE_CHARS = 300
+export const MAX_NOTE_CHARS = 200
+const MAX_SHELL_TARGETS = 10
+
+// A claim is a session saying "this is mine for now": a file, a folder, or a
+// named resource such as port:3000 or db:local. It lasts while the session is live.
+export type Claim = { resource: string; note: string; at: number }
 
 export type SessionRecord = {
   shape: number
@@ -22,6 +30,8 @@ export type SessionRecord = {
   started: number
   intent: string
   touched: Record<string, number>
+  // Optional so a 0.1.0 session's record still reads as a peer.
+  claims?: Claim[]
   ended?: boolean
 }
 
@@ -97,6 +107,88 @@ export const racingGitVerb = (command: string): string | null => RACING_GIT.exec
 export const sameCheckout = (peers: readonly SessionRecord[], repo: string | null): SessionRecord[] =>
   repo === null ? [] : peers.filter(peer => peer.repo === repo)
 
+const unquote = (token: string) => token.replace(/^(["'])(.*)\1$/, '$2')
+
+const QUOTED_OR_BARE = String.raw`("[^"]+"|'[^']+'|[^\s;&|<>()]+)`
+
+// The folder a shell command really works in: a leading `cd X &&` / `cd X;`
+// (also `Set-Location X;`), else the session's own folder.
+export const commandDir = (command: string, cwd: string): string => {
+  const cd = new RegExp(String.raw`^\s*(?:cd|Set-Location|pushd)\s+${QUOTED_OR_BARE}\s*(?:&&|;)`, 'i').exec(command)
+  return cd?.[1] ? normPath(unquote(cd[1]), cwd) : normPath(cwd, cwd)
+}
+
+// The folder git acts on: `git -C X ...` wins over the command's folder.
+export const gitDir = (command: string, cwd: string): string => {
+  const base = commandDir(command, cwd)
+  const flag = new RegExp(String.raw`\bgit\s+-C\s+${QUOTED_OR_BARE}`).exec(command)
+  return flag?.[1] ? normPath(unquote(flag[1]), base) : base
+}
+
+const isRealTarget = (target: string) =>
+  target.length > 0 &&
+  !/^(\/dev\/(null|stdout|stderr)|nul|\$null|&\d|\d)$/i.test(target) &&
+  !/[$*?`]/.test(target)
+
+// Files a shell command writes, read from the shapes that cover most real use:
+// `>`/`>>` redirects, `tee`, `sed -i`, and PowerShell's Set-Content, Add-Content
+// and Out-File. A miss lets the write through unrecorded, never blocks it.
+export const shellWriteTargets = (command: string, cwd: string): string[] => {
+  const base = commandDir(command, cwd)
+  const found: string[] = []
+  const add = (raw: string | undefined) => {
+    const target = raw ? unquote(raw) : ''
+    if (isRealTarget(target)) found.push(normPath(target, base))
+  }
+  for (const m of command.matchAll(new RegExp(String.raw`(?:^|[^<>&\d=])\d?>>?\s*${QUOTED_OR_BARE}`, 'g'))) add(m[1])
+  for (const m of command.matchAll(new RegExp(String.raw`\btee\s+(?:-a\s+|--append\s+)?${QUOTED_OR_BARE}`, 'g'))) add(m[1])
+  for (const m of command.matchAll(/\bsed\s+(?:-[a-zA-Z]*\s+)*-i\S*\s+(?:-e\s+)?("[^"]*"|'[^']*'|\S+)\s+([^;&|]+)/g)) {
+    for (const file of (m[2] ?? '').trim().split(/\s+/)) add(file)
+  }
+  for (const m of command.matchAll(new RegExp(String.raw`\b(?:Set-Content|Add-Content|Out-File)\b(?:\s+-(?:Path|FilePath|LiteralPath))?\s+${QUOTED_OR_BARE}`, 'gi'))) add(m[1])
+  return [...new Set(found)].slice(0, MAX_SHELL_TARGETS)
+}
+
+// A path-like claim is normalised like a file; anything else (port:3000) is a name.
+export const normResource = (resource: string, cwd: string): string => {
+  const trimmed = resource.trim().slice(0, MAX_RESOURCE_CHARS)
+  const isPathLike = /[\\/]/.test(trimmed) || /^[a-zA-Z]:/.test(trimmed) || trimmed.startsWith('.') || /\.\w{1,8}$/.test(trimmed)
+  return isPathLike && !/^\w+:\d+$/.test(trimmed) ? normPath(trimmed, cwd) : trimmed.toLowerCase()
+}
+
+const covers = (outer: string, inner: string) => inner === outer || inner.startsWith(`${outer.replace(/\/$/, '')}/`)
+
+export type ClaimConflict = { peer: SessionRecord; claim: Claim }
+
+// A file inside a folder a live peer claimed.
+export const claimConflict = (peers: readonly SessionRecord[], path: string): ClaimConflict | null => {
+  for (const peer of peers) {
+    const claim = (peer.claims ?? []).find(c => covers(c.resource, path))
+    if (claim) return { peer, claim }
+  }
+  return null
+}
+
+// Peer claims that overlap what this session wants, in either direction:
+// claiming src/ while a peer holds src/api.py is still a clash.
+export const overlappingClaims = (peers: readonly SessionRecord[], resources: readonly string[]): ClaimConflict[] =>
+  peers.flatMap(peer =>
+    (peer.claims ?? [])
+      .filter(c => resources.some(r => covers(c.resource, r) || covers(r, c.resource)))
+      .map(claim => ({ peer, claim })),
+  )
+
+export const addClaims = (record: SessionRecord, resources: readonly string[], note: string, now: number): SessionRecord => {
+  const kept = (record.claims ?? []).filter(c => !resources.includes(c.resource))
+  const added = resources.map(resource => ({ resource, note: note.slice(0, MAX_NOTE_CHARS), at: now }))
+  return { ...record, claims: [...added, ...kept].slice(0, MAX_CLAIMS) }
+}
+
+export const releaseClaims = (record: SessionRecord, resources: readonly string[]): SessionRecord => ({
+  ...record,
+  claims: resources.length ? (record.claims ?? []).filter(c => !resources.includes(c.resource)) : [],
+})
+
 const ago = (then: number, now: number) => {
   const minutes = Math.max(0, Math.round((now - then) / 60_000))
   return minutes === 0 ? 'just now' : `${minutes} min ago`
@@ -107,18 +199,21 @@ export const describePeer = (peer: SessionRecord, now: number, ownRepo: string |
   const files = recent.length ? recent.map(([path, at]) => `${path} (${ago(at, now)})`).join(', ') : 'none yet'
   const where = peer.repo ? `${peer.repo}${peer.branch ? ` @ ${peer.branch}` : ''}` : peer.cwd
   const shared = ownRepo !== null && peer.repo === ownRepo ? ' [SAME CHECKOUT AS YOU]' : ''
+  const claims = (peer.claims ?? []).map(c => `${c.resource}${c.note ? ` (${c.note})` : ''}`)
   return [
     `- ${peer.id.slice(0, 8)} in ${where}${shared}`,
     `  doing: ${peer.intent || '(no task typed yet)'}`,
     `  recent edits: ${files}`,
+    ...(claims.length ? [`  claims: ${claims.join(', ')}`] : []),
   ].join('\n')
 }
 
 export const PEER_GUIDANCE = [
   'A peer in the same checkout or the same files can be overwritten by you, or can commit or push your half-done work.',
-  'Before touching what a peer touched: re-read the file, prefer your own branch or git worktree, and git fetch before any push.',
+  'Before touching what a peer touched or claimed: re-read the file, prefer your own branch or git worktree, and git fetch before any push.',
+  'Claim the files, folders or resources (port:3000, db:local) you are about to work on with the mcp__peer-sessions__claim tool, so peers are warned off them.',
   'If your task overlaps a peer\'s, tell it what you are about to change (ListAgents finds it, SendMessage reaches it) or ask the user which session owns the work.',
-  'Run /peer-sessions for the current list.',
+  'mcp__peer-sessions__peers or /peer-sessions shows the current list.',
 ].join(' ')
 
 export const peersBlock = (heading: string, peers: readonly SessionRecord[], now: number, ownRepo: string | null): string =>
