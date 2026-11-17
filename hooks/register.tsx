@@ -309,14 +309,22 @@ async function checkGit($: EngineInterface, command: unknown): Promise<string | 
       `git ${verb} on it can race that session's work. That session has been told. Agree with it (mcp__peer-sessions__message) or the user first, or work on your own branch. Running the same command again goes through.`,
     ].join(' ')
   }
-  const peer = sameCheckout(peers, repo).find(p => !warned.has(`git|${p.id}|${repo}|${verb}`))
-  if (!peer) return null
-  warned.add(`git|${peer.id}|${repo}|${verb}`)
-  await handoff($, peer, `I was about to run git ${verb} in ${repo}, the checkout you are working in. My task: ${own ? taskOf(own) : 'no task typed yet'}.`)
+  // One refusal per (repo, verb), naming every live peer sharing the checkout, so the
+  // retry goes through once regardless of how many peers share it (not once per peer).
+  const sharing = sameCheckout(peers, repo)
+  if (!sharing.length || warned.has(`git|${repo}|${verb}`)) return null
+  warned.add(`git|${repo}|${verb}`)
+  for (const p of sharing) {
+    await handoff($, p, `I was about to run git ${verb} in ${repo}, the checkout you are working in. My task: ${own ? taskOf(own) : 'no task typed yet'}.`)
+  }
+  const who =
+    sharing.length === 1
+      ? `Session ${sharing[0].id.slice(0, 8)} is live in the checkout this git ${verb} acts on (${repo}${sharing[0].branch ? ` @ ${sharing[0].branch}` : ''}), doing: ${taskOf(sharing[0])}.`
+      : `${sharing.length} live sessions share the checkout this git ${verb} acts on (${repo}): ${sharing.map(p => `${p.id.slice(0, 8)} (${taskOf(p)})`).join('; ')}.`
   return [
-    `[peer-sessions] Session ${peer.id.slice(0, 8)} is live in the checkout this git ${verb} acts on (${repo}${peer.branch ? ` @ ${peer.branch}` : ''}), doing: ${taskOf(peer)}.`,
-    `git ${verb} there can sweep its uncommitted changes into your commit, move the branch under it, or race its push.`,
-    'That session has been told. Run git status and git fetch, check what is yours, and coordinate with it (mcp__peer-sessions__message) or ask the user. Running the same command again goes through.',
+    `[peer-sessions] ${who}`,
+    `git ${verb} there can sweep uncommitted changes into your commit, move the branch under them, or race a push.`,
+    `${sharing.length === 1 ? 'That session has' : 'They have'} been told. Run git status and git fetch, check what is yours, and coordinate (mcp__peer-sessions__message) or ask the user. Running the same command again goes through.`,
   ].join(' ')
 }
 

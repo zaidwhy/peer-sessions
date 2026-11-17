@@ -192,7 +192,7 @@ test('editing a file a live peer just edited is refused once, then allowed', asy
   expect(Object.keys(w.ownRecord().touched)).toEqual(['c:/work/app/src/invoice.py'])
 })
 
-test('interleaving: git refusal is once PER live peer in the shared checkout (documents current behavior; see NOTES-bugpass.md proposal)', async ($, on) => {
+test('interleaving: git refusal fires once per checkout and names every sharing peer, then the retry runs', async ($, on) => {
   const w = world(on)
   // Peer B claims the src folder; peer C only shares the checkout.
   w.seedPeer({ claims: [{ resource: 'c:/work/app/src', note: 'api rewrite', at: 0 }] })
@@ -205,24 +205,23 @@ test('interleaving: git refusal is once PER live peer in the shared checkout (do
   })
   await $.session.start(start)
 
-  // Edit inside B's claim -> refused once, naming the claim; the retry (one claiming peer) runs.
+  // Edit inside B's claim -> refused once, naming the claim; the retry runs.
   const edit = await $.tool.call({ tool: 'Edit', file_path: 'C:/work/app/src/api.py', old_string: 'a', new_string: 'b' })
   expect(JSON.stringify(edit)).toContain('api rewrite')
   expect(w.ranTools).toEqual([])
   await $.tool.call({ tool: 'Edit', file_path: 'C:/work/app/src/api.py', old_string: 'a', new_string: 'b' })
   expect(w.ranTools).toEqual(['Edit'])
 
-  // git commit: TWO peers share the checkout, and the refusal is keyed per peer, so the
-  // command is refused once for B and again for C before it runs - even though the refusal
-  // text promises "running the same command again goes through". This mismatch is recorded
-  // as a proposal in NOTES-bugpass.md (refuse once per checkout, or soften the message).
+  // git commit: two peers share the checkout, but the refusal is keyed per (repo, verb), so it
+  // fires ONCE naming both peers, and the single retry goes through (the "run again" promise holds).
   const commit1 = await $.tool.call({ tool: 'Bash', command: 'git commit -am wip' })
-  expect(JSON.stringify(commit1)).toContain('git commit')
-  const commit2 = await $.tool.call({ tool: 'Bash', command: 'git commit -am wip' })
-  expect(JSON.stringify(commit2)).toContain('cccccccc') // refused again, naming the second peer
-  expect(w.ranTools).toEqual(['Edit']) // still not run after two attempts
+  const text = JSON.stringify(commit1)
+  expect(text).toContain('git commit')
+  expect(text).toContain('bbbbbbbb')
+  expect(text).toContain('cccccccc') // both sharing peers named in the one refusal
+  expect(w.ranTools).toEqual(['Edit'])
   await $.tool.call({ tool: 'Bash', command: 'git commit -am wip' })
-  expect(w.ranTools).toEqual(['Edit', 'Bash']) // third attempt (both peers now warned) runs
+  expect(w.ranTools).toEqual(['Edit', 'Bash']) // one retry runs, regardless of peer count
 })
 
 test('a peer that stopped heartbeating no longer blocks anything', async ($, on) => {
