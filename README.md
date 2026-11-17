@@ -148,7 +148,7 @@ claude plugin validate .
 claude plugin test .
 ```
 
-`hooks/registry.ts` holds every rule as plain functions; `hooks/register.tsx` wires them to the engine's events and draws the band. `tests/peer-sessions.test.tsx` runs the module against an in-memory disk and seeded peers: 56 tests covering the briefing, every hold-back and its one-time retry, both modes, the automatic handoff, message delivery and expiry, the read-after-edit skip, the trail, blame and pinned notes (including expiry and other repositories), `wait_for` with its watch waking an idle session or arriving mid-turn, the tools and the `/peer-sessions` subcommands, task privacy, the band on terminal and desktop, worktrees, non-repos and a broken disk.
+`hooks/registry.ts` holds every rule as plain functions; `hooks/register.tsx` wires them to the engine's events and draws the band. `tests/peer-sessions.test.tsx` runs the module against an in-memory disk and seeded peers: 60 tests covering the briefing, every hold-back and its one-time retry, both modes, the automatic handoff, message delivery and expiry, the read-after-edit skip, the trail, blame and pinned notes (including expiry and other repositories), `wait_for` with its watch waking an idle session or arriving mid-turn, the tools and the `/peer-sessions` subcommands, task privacy, the band on terminal and desktop, worktrees, non-repos and a broken disk. The shell-write reader is checked against quoted version specifiers and operators, path identity across case and slashes, and a three-session claim/edit/commit interleaving.
 
 ## Changelog
 

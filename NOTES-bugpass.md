@@ -1,7 +1,16 @@
 # peer-sessions bug pass - 2026-11-18
 
-Branch: `bugfix/shellwrite-falsepos` (local, not pushed). Tests: 58 pass, 0 fail
-(`claude plugin test .`), up from 56 (one fix test, one behavior-documenting test).
+## Branches to pick from (all local, not pushed)
+
+| Branch | What it changes | Tests | Recommendation |
+|---|---|---|---|
+| `bugfix/shellwrite-falsepos` | Fixes the real shellWriteTargets false-positive on quoted version specs (`pip "x>=1.0"` -> phantom edit); adds redirect-shape, path-identity and three-session interleaving tests; README test count 56 -> 60 | 60 pass | Merge - clear bug fix, no behavior tradeoff |
+| `proposal/git-refusal-once` (off bugfix) | git collision refuses once per (repo, verb) naming every sharing peer, so the "run again goes through" promise holds with 2+ peers (was once per peer) | 60 pass | Merge if you prefer one refusal per command; the only cost is the message lists all peers instead of one at a time |
+| junction-identity | Not a branch - not implemented | n/a | Leave documented: no engine realpath API; per-file realpath is a subprocess on the hot path. Repo root is already git-resolved, so git collisions already unify across junctions; only file paths mismatch |
+| awk-jq-redirects | Not a branch - not implemented | n/a | Leave documented: needs a quote-aware scanner rewrite; low harm (one phantom target = one spurious refusal, writes never block) |
+
+Branch: `bugfix/shellwrite-falsepos` (local, not pushed). Tests: 60 pass, 0 fail
+(`claude plugin test .`), up from 56.
 
 ## 1. Tests run
 
@@ -143,3 +152,25 @@ pure. Behavior change -> proposal.
 Branch bugfix/shellwrite-falsepos, local, not pushed. 60 tests pass, craft-guard clean. One
 fix applied (version-spec false positive). Further items documented as proposals or
 already-covered. No behavior-changing rewrite done without Zaid's sign-off.
+
+---
+
+# README truth pass - 2026-11-18
+
+Every behavior claim in README.md checked against a test or the code:
+- Silent with one session / talks on the second: statusText returns undefined with no peers. Test.
+- One JSON file per session, writes only its own: fileOf / save. Code + README "How it works".
+- Task line = first prompt line, 160 chars, not from notifications/short replies: intentFrom, MAX_INTENT_CHARS. Test.
+- Files written in last 30 min, 200 at most: EDIT_CONFLICT_MS, MAX_TOUCHED. Code.
+- Heartbeat every 60s, gone after "about 3 minutes": HEARTBEAT_MS 60s, LIVE_MS 195s (3m15s). Test (drop at 10 min). "About 3 minutes" is accurate enough.
+- Shell writes from >, >>, tee, sed -i, Set-Content, Add-Content, Out-File; cp/mv and $var targets not traced: shellWriteTargets. Test.
+- Fails open on a broken registry: Test.
+- Messages kept 30 min, delivered once with next tool result/prompt, broadcasts to later openers, from ended senders too: MESSAGE_TTL_MS, inboxFor. Tests.
+- Trail/history/notes 7 days, blame within a day: TRAIL_MS, MAX_NOTE_HOURS, BLAME_MS. Tests.
+- Inboxes checked at most every 10s between prompts: INBOX_EVERY_MS. Code.
+- Cannot delete files; clear the folder by hand: $.fs has no delete. Code.
+- Task line never leaves the machine; shareTask off keeps it out: isTaskShared. Test.
+
+One wrong fact fixed: "56 tests" -> "60 tests" (line 151), plus the new coverage areas named.
+No claim found with no backing. The README's "one hold-back per peer and target" is accurate
+for current (bugfix) behavior; the git-refusal-once branch changes it to one per command.
