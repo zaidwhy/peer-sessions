@@ -10,6 +10,8 @@ peer-sessions gives every session on the machine a shared picture: who else is l
 
 Nothing to configure. It is silent while you run one session and starts talking the moment a second one opens.
 
+See it in two panes in 30 seconds: [`demo/`](demo/).
+
 ## What you see
 
 **Above the prompt**, whenever another session shares your checkout or a message arrives:
