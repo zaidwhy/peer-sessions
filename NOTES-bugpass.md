@@ -85,3 +85,61 @@ watched session's `~/.claude/peer-sessions/<id>.json` mtime had gone stale.
 - Changed only `hooks/registry.ts` (`isRealTarget`) and `tests/peer-sessions.test.tsx`.
 - No change to `.claude-plugin/` (marketplace/publishing untouched - 406023d1 owns that).
 - Committed to a branch; not pushed to main; nothing published.
+
+---
+
+# Deeper pass - 2026-11-18 (same branch)
+
+Coordinator correction accepted: the immediate idle-notice (first-pass item 4) is the
+harness's SendMessage notify_when_idle, not this plugin - dropped. "rce" / "rce:" and the
+stray erdos/oeis names never existed as files; same false-positive class as the version
+spec bug. Tests: 60 pass, 0 fail.
+
+## 5. Redirect-regex shapes - checked, one documented limitation
+
+Test added: "operators and fd-dups inside commands are not read as redirect targets".
+Safe already (return []): `2>&1`, `>&2` (digit/`&` before `>` excluded), `2>$null` (target
+`$null` rejected), `=>` (`=` before `>` excluded), `->` inside `python -c "..."` (captured
+target carries the closing quote, rejected by the first-pass quote guard).
+
+PROPOSAL (not fixed): a `>` comparison inside a quoted awk/jq program with a bare numeric
+or identifier operand (`awk '$1 > 5.5'` -> `5.5`; `jq '.a > .b'` -> `.b`) is read as a
+target. Same root as the version-spec bug: the regex cannot separate a `>` inside quotes
+from a redirect. Fix option: a quote-aware scan that skips `>` seen inside single/double
+quotes, then captures the next token (quoted or bare) as the target. That rewrites redirect
+parsing and carries new edge cases, so it is a proposal. Current behavior is pinned by the
+test. Harm if left: one phantom target = at most one spurious edit-conflict refusal; writes
+never block (the function fails open).
+
+## 6. Windows path identity (item 2)
+
+Test added: "Windows path identity: case and slash direction unify; junctions and 8.3 names
+do not". Case, slash direction, and `.`/`..` normalize to one key, so claims and edit
+conflicts match across those spellings.
+
+PROPOSAL (not fixed): normPath is a pure string function with no filesystem access, so a
+junction (this machine has Atlas\Projects -> projects) and an 8.3 short name (PROGRA~1) are
+not resolved to their real path. The same file reached through the junction is a different
+key, so a claim or edit on one side does not guard the other. Fix option: resolve the real
+path once per unique input (async realpath, cached) in the hook layer, leaving normPath
+pure. Behavior change -> proposal.
+
+## 7. Lifecycle (item 3) and three-session interleaving (item 4) - already covered
+
+- Stale registry entry: "a peer that stopped heartbeating no longer blocks anything"
+  (drops after LIVE_MS). Covered.
+- Stale claim: a claim lives on the owner's record; when the owner stops heartbeating its
+  record leaves livePeers, so claimConflict stops enforcing it. Covered.
+- Two sessions registering at the same instant: each writes only its own id-named file, so
+  there is no shared-write race by construction (README "How it works"). No test needed.
+- Claim released while a wait_for watch is pending: "wait_for returns once a peer gives the
+  branch back" and "...hands a long wait to a watch that wakes the idle session". Covered.
+- Three-session interleaving: "interleaving: git refusal is once PER live peer in the shared
+  checkout" runs own + two peers across claim + edit + git-commit orderings; it surfaced the
+  per-peer git-refusal proposal. Covered.
+
+## Status
+
+Branch bugfix/shellwrite-falsepos, local, not pushed. 60 tests pass, craft-guard clean. One
+fix applied (version-spec false positive). Further items documented as proposals or
+already-covered. No behavior-changing rewrite done without Zaid's sign-off.
