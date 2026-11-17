@@ -156,6 +156,10 @@ export const gitDir = (command: string, cwd: string): string => {
 
 const isRealTarget = (target: string) =>
   target.length > 0 &&
+  // A ">" inside a quoted version spec ("pkg>=1.0") is not a redirect: its "target"
+  // starts with "=" (from ">=") or carries an unbalanced quote. Neither is a real path.
+  !target.startsWith('=') &&
+  !/["']/.test(target) &&
   !/^(\/dev\/(null|stdout|stderr)|nul|\$null|&\d|\d)$/i.test(target) &&
   !/[$*?`]/.test(target)
 
