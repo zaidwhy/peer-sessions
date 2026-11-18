@@ -111,6 +111,16 @@ test('paths are one spelling per file on Windows, untouched elsewhere', () => {
   expect(normPath('/home/dev/App.py', '/home/dev')).toBe('/home/dev/App.py')
 })
 
+test('Windows path identity: case and slash direction unify; junctions and 8.3 names do not', () => {
+  // The same file via mixed case and slash direction normalizes to one key, so claims and
+  // edit conflicts match across those spellings.
+  expect(normPath('C:\\Work\\App\\SRC\\api.py', 'C:/x')).toBe(normPath('c:/work/app/src/api.py', 'C:/x'))
+  // Known limitation (NOTES-bugpass.md): normPath is pure string with no filesystem realpath,
+  // so a junction or an 8.3 short name is not resolved to its real target. The same file reached
+  // through Atlas\Projects (a junction to projects) counts as a different path.
+  expect(normPath('C:\\Atlas\\Projects\\app\\x.py', 'C:/x')).not.toBe(normPath('C:\\Users\\Asus\\projects\\app\\x.py', 'C:/x'))
+})
+
 test('only state-changing git commands count as racing', () => {
   expect(racingGitVerb('git -C ../x commit -m "wip"')).toBe('commit')
   expect(racingGitVerb('git fetch origin && git push')).toBe('push')
@@ -180,6 +190,39 @@ test('editing a file a live peer just edited is refused once, then allowed', asy
   await $.tool.call({ tool: 'Edit', file_path: 'C:/work/app/src/invoice.py', old_string: 'a', new_string: 'b' })
   expect(w.ranTools).toEqual(['Edit'])
   expect(Object.keys(w.ownRecord().touched)).toEqual(['c:/work/app/src/invoice.py'])
+})
+
+test('interleaving: git refusal is once PER live peer in the shared checkout (documents current behavior; see NOTES-bugpass.md proposal)', async ($, on) => {
+  const w = world(on)
+  // Peer B claims the src folder; peer C only shares the checkout.
+  w.seedPeer({ claims: [{ resource: 'c:/work/app/src', note: 'api rewrite', at: 0 }] })
+  w.files.set(`${DIR}/cccccccc-peer-session.json`, {
+    mtimeMs: w.clock.now(),
+    text: JSON.stringify({
+      shape: SHAPE, id: 'cccccccc-peer-session', cwd: 'c:/work/app', repo: 'c:/work/app',
+      branch: 'main', started: w.clock.now(), intent: 'run the migration', touched: {},
+    }),
+  })
+  await $.session.start(start)
+
+  // Edit inside B's claim -> refused once, naming the claim; the retry (one claiming peer) runs.
+  const edit = await $.tool.call({ tool: 'Edit', file_path: 'C:/work/app/src/api.py', old_string: 'a', new_string: 'b' })
+  expect(JSON.stringify(edit)).toContain('api rewrite')
+  expect(w.ranTools).toEqual([])
+  await $.tool.call({ tool: 'Edit', file_path: 'C:/work/app/src/api.py', old_string: 'a', new_string: 'b' })
+  expect(w.ranTools).toEqual(['Edit'])
+
+  // git commit: TWO peers share the checkout, and the refusal is keyed per peer, so the
+  // command is refused once for B and again for C before it runs - even though the refusal
+  // text promises "running the same command again goes through". This mismatch is recorded
+  // as a proposal in NOTES-bugpass.md (refuse once per checkout, or soften the message).
+  const commit1 = await $.tool.call({ tool: 'Bash', command: 'git commit -am wip' })
+  expect(JSON.stringify(commit1)).toContain('git commit')
+  const commit2 = await $.tool.call({ tool: 'Bash', command: 'git commit -am wip' })
+  expect(JSON.stringify(commit2)).toContain('cccccccc') // refused again, naming the second peer
+  expect(w.ranTools).toEqual(['Edit']) // still not run after two attempts
+  await $.tool.call({ tool: 'Bash', command: 'git commit -am wip' })
+  expect(w.ranTools).toEqual(['Edit', 'Bash']) // third attempt (both peers now warned) runs
 })
 
 test('a peer that stopped heartbeating no longer blocks anything', async ($, on) => {
@@ -277,6 +320,33 @@ test('shell writes are read from redirects, tee, sed -i and PowerShell content c
   expect(shellWriteTargets('Add-Content -Path notes.md -Value done', CWD)).toEqual(['c:/work/app/notes.md'])
   expect(shellWriteTargets('echo hi > /dev/null; ls 2>/dev/null; echo $x > $target', CWD)).toEqual([])
   expect(shellWriteTargets('git log --oneline -5', CWD)).toEqual([])
+})
+
+test('version specifiers and comparisons inside args are not read as redirect targets', () => {
+  // A ">" inside a quoted pip/npm version spec is not a shell redirect; it must not
+  // become a phantom write target (seen live as a stray "=3.14.0\"" edit).
+  expect(shellWriteTargets('pip install "numpy>=3.14.0"', CWD)).toEqual([])
+  expect(shellWriteTargets("pip install 'torch>=2.1'", CWD)).toEqual([])
+  expect(shellWriteTargets('pip install "pkg>1.0"', CWD)).toEqual([])
+  expect(shellWriteTargets('uv add "fastapi>=0.110,<0.120"', CWD)).toEqual([])
+  // A genuine redirect next to a version spec is still caught.
+  expect(shellWriteTargets('pip install "numpy>=3.14.0" > install.log', CWD)).toEqual(['c:/work/app/install.log'])
+})
+
+test('operators and fd-dups inside commands are not read as redirect targets', () => {
+  // Safe via the char class (digit / & / = before >) or the quote/= guard in isRealTarget.
+  expect(shellWriteTargets('make 2>&1', CWD)).toEqual([])
+  expect(shellWriteTargets('echo hi >&2', CWD)).toEqual([])
+  expect(shellWriteTargets('Get-Item x 2>$null', CWD)).toEqual([])
+  expect(shellWriteTargets('node -e "const f = a => a+1"', CWD)).toEqual([]) // "=" before ">" is excluded
+  expect(shellWriteTargets('python -c "cb = lambda x: x->y"', CWD)).toEqual([]) // captured "y\"" carries a quote
+  // Genuine redirects still captured.
+  expect(shellWriteTargets('run > out.txt', CWD)).toEqual(['c:/work/app/out.txt'])
+  expect(shellWriteTargets('run >> logs/app.log', CWD)).toEqual(['c:/work/app/logs/app.log'])
+  // Known limitation (NOTES-bugpass.md): a ">" comparison inside a quoted awk/jq program with
+  // a bare numeric or identifier operand is still read as a target. Quote-aware scanning would
+  // fix it; this pins the current behavior so a future change is a deliberate edit.
+  expect(shellWriteTargets("awk '$1 > 5.5 {print}' data", CWD)).toEqual(['c:/work/app/5.5'])
 })
 
 test('git targets the folder -C or a leading cd names', () => {
