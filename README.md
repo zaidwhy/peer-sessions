@@ -4,13 +4,15 @@ Run three Claude Code sessions on one machine and none of them knows the others 
 
 peer-sessions gives every session on the machine a shared picture: who else is live, in which repo and branch, doing what, touching which files, holding which resources. Sessions message each other, wait for each other, and remember what earlier sessions did in a repository. The one edit or git command that would race a live peer is held back once, with the reason, before it happens.
 
+![Two Claude Code sessions in one folder: the left session claims invoice.py, the right session's edit of the same file is held back once with the reason.](demo/peer-sessions-demo.gif)
+
 ```
 /plugin install peer-sessions --marketplace zaidwhy/peer-sessions
 ```
 
 Nothing to configure. It is silent while you run one session and starts talking the moment a second one opens.
 
-See it in two panes in 30 seconds: [`demo/`](demo/).
+See it in two panes: [`demo/peer-sessions-demo.gif`](demo/peer-sessions-demo.gif) (also an MP4), or run it live with two real sessions from [`demo/`](demo/).
 
 ## What you see
 
