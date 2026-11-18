@@ -133,6 +133,8 @@ claude plugin update peer-sessions@peer-sessions
 ## Limits
 
 - Shell writes are read from the command text, not traced: a script, a formatter, `cp`/`mv`, or a path held in a variable (`> $out`) is not recorded. A miss lets the write through; it never blocks one.
+- A `>` comparison inside a quoted program with a bare operand (`awk '$1 > 5.5'`, `jq '.a > .b'`) is still read as a write target. Quoted version specifiers (`pip "x>=1.0"`) are not. A phantom target is at worst one spurious hold-back; writes never block.
+- Paths are matched by case and slash direction, but not resolved through symlinks, Windows junctions or 8.3 short names: the same file reached through a junction counts as a different path for claims and edit conflicts.
 - Named claims such as `port:3000` are reported, not enforced: nothing stops a dev server binding the port.
 - Subagents of one session share its id, so they never hold each other back. Give parallel subagents their own worktrees.
 - A session idle at the prompt reads its messages when you next type there. Between prompts, inboxes are checked at most every 10 seconds.
