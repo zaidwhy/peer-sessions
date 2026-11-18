@@ -154,6 +154,7 @@ claude plugin test .
 
 ## Changelog
 
+- **0.5.1:** the shell-write reader no longer reads a quoted version specifier (`pip "x>=1.0"`) as a write target, so it stops a spurious hold-back on install commands; added tests for operators and version specs, path identity across case and slashes, and a three-session claim/edit/commit interleaving.
 - **0.5.0:** a repository memory: the trail of earlier sessions on the first prompt, blame on the first write to a file, the `history` tool, and pinned notes (`pin`) that outlive their session; `wait_for` with watches that message or wake the session when a peer ends or a claim clears.
 - **0.4.0:** a band above the prompt and toasts, so you see peers and messages, not only the model; `/peer-sessions msg|claim|release|help`; settings: `mode` (refuse or warn) and `shareTask`.
 - **0.3.0:** sessions message each other (`message` tool, delivered with the next tool result); every refusal is handed to the peer it was about; branch claims across worktrees; no refusal when the file was read after the peer's edit; prompts from `claude -p`, Remote Control, coordinators and `/loop` count as the task.
