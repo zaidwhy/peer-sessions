@@ -163,22 +163,79 @@ const isRealTarget = (target: string) =>
   !/^(\/dev\/(null|stdout|stderr)|nul|\$null|&\d|\d)$/i.test(target) &&
   !/[$*?`]/.test(target)
 
+const HEREDOC = /<<(-?)[ \t]*(['"]?)([A-Za-z_][\w-]*)\2[^\n]*\n/g
+const HERE_STRING = /@(['"])\r?\n[\s\S]*?\r?\n\1@/g
+
+// The command with everything that is content rather than shell syntax blanked to "_":
+// heredoc bodies, PowerShell here-strings and the inside of quoted strings. Newlines and
+// length are kept, so a match found here sits at the same offsets in the original.
+// Without this, ".row-static > .heat" inside a CSS heredoc read as a write to ".heat".
+export const maskShellContent = (command: string): string => {
+  const out = command.split('')
+  const blank = (from: number, to: number) => {
+    for (let i = from; i < to; i++) if (out[i] !== '\n' && out[i] !== '\r') out[i] = '_'
+  }
+  for (const m of command.matchAll(HEREDOC)) {
+    const bodyStart = (m.index ?? 0) + m[0].length
+    let lineStart = bodyStart
+    let bodyEnd = command.length
+    while (lineStart < command.length) {
+      const lineEnd = command.indexOf('\n', lineStart)
+      const line = command.slice(lineStart, lineEnd === -1 ? undefined : lineEnd).replace(/\r$/, '')
+      if ((m[1] ? line.replace(/^\t+/, '') : line) === m[3]) {
+        bodyEnd = lineStart
+        break
+      }
+      if (lineEnd === -1) break
+      lineStart = lineEnd + 1
+    }
+    blank(bodyStart, bodyEnd)
+  }
+  for (const m of command.matchAll(HERE_STRING)) blank((m.index ?? 0) + 2, (m.index ?? 0) + m[0].length - 2)
+  let i = 0
+  while (i < out.length) {
+    const c = out[i]
+    if (c === '\\') {
+      i += 2
+      continue
+    }
+    if (c === "'" || c === '"') {
+      let j = i + 1
+      while (j < out.length && out[j] !== c) j += c === '"' && out[j] === '\\' ? 2 : 1
+      blank(i + 1, Math.min(j, out.length))
+      i = j + 1
+      continue
+    }
+    i++
+  }
+  return out.join('')
+}
+
 // Files a shell command writes, read from the shapes that cover most real use:
 // `>`/`>>` redirects, `tee`, `sed -i`, and PowerShell's Set-Content, Add-Content
-// and Out-File. A miss lets the write through unrecorded, never blocks it.
+// and Out-File. Patterns run on the masked command; the target text is then read from
+// the original at the same offsets. A miss lets the write through unrecorded, never blocks it.
 export const shellWriteTargets = (command: string, cwd: string): string[] => {
   const base = commandDir(command, cwd)
+  const masked = maskShellContent(command)
   const found: string[] = []
-  const add = (raw: string | undefined) => {
-    const target = raw ? unquote(raw) : ''
+  // Every pattern ends with the group that holds the target, so it sits at the end of the match.
+  const lastGroup = (m: RegExpMatchArray) => {
+    const end = (m.index ?? 0) + m[0].length
+    return command.slice(end - (m[m.length - 1] ?? '').length, end)
+  }
+  const add = (raw: string) => {
+    const target = unquote(raw)
     if (isRealTarget(target)) found.push(normPath(target, base))
   }
-  for (const m of command.matchAll(new RegExp(String.raw`(?:^|[^<>&\d=])\d?>>?\s*${QUOTED_OR_BARE}`, 'g'))) add(m[1])
-  for (const m of command.matchAll(new RegExp(String.raw`\btee\s+(?:-a\s+|--append\s+)?${QUOTED_OR_BARE}`, 'g'))) add(m[1])
-  for (const m of command.matchAll(/\bsed\s+(?:-[a-zA-Z]*\s+)*-i\S*\s+(?:-e\s+)?("[^"]*"|'[^']*'|\S+)\s+([^;&|]+)/g)) {
-    for (const file of (m[2] ?? '').trim().split(/\s+/)) add(file)
+  for (const m of masked.matchAll(new RegExp(String.raw`(?:^|[^<>&\d=])\d?>>?\s*${QUOTED_OR_BARE}`, 'g'))) add(lastGroup(m))
+  for (const m of masked.matchAll(new RegExp(String.raw`\btee\s+(?:-a\s+|--append\s+)?${QUOTED_OR_BARE}`, 'g'))) add(lastGroup(m))
+  const SED_SCRIPT = String.raw`(?:"[^"]*"|'[^']*'|\S+)`
+  const sed = new RegExp(String.raw`\bsed\s+(?:-[a-zA-Z]*\s+)*-i\S*\s+(?:-e\s+)?${SED_SCRIPT}\s+(?:(?:-e|--expression)\s+${SED_SCRIPT}\s+)*([^;&|\n]+)`, 'g')
+  for (const m of masked.matchAll(sed)) {
+    for (const file of lastGroup(m).trim().split(/\s+/)) if (!file.startsWith('-')) add(file)
   }
-  for (const m of command.matchAll(new RegExp(String.raw`\b(?:Set-Content|Add-Content|Out-File)\b(?:\s+-(?:Path|FilePath|LiteralPath))?\s+${QUOTED_OR_BARE}`, 'gi'))) add(m[1])
+  for (const m of masked.matchAll(new RegExp(String.raw`\b(?:Set-Content|Add-Content|Out-File)\b(?:\s+-(?:Path|FilePath|LiteralPath))?\s+${QUOTED_OR_BARE}`, 'gi'))) add(lastGroup(m))
   return [...new Set(found)].slice(0, MAX_SHELL_TARGETS)
 }
 

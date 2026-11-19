@@ -343,10 +343,42 @@ test('operators and fd-dups inside commands are not read as redirect targets', (
   // Genuine redirects still captured.
   expect(shellWriteTargets('run > out.txt', CWD)).toEqual(['c:/work/app/out.txt'])
   expect(shellWriteTargets('run >> logs/app.log', CWD)).toEqual(['c:/work/app/logs/app.log'])
-  // Known limitation (NOTES-bugpass.md): a ">" comparison inside a quoted awk/jq program with
-  // a bare numeric or identifier operand is still read as a target. Quote-aware scanning would
-  // fix it; this pins the current behavior so a future change is a deliberate edit.
-  expect(shellWriteTargets("awk '$1 > 5.5 {print}' data", CWD)).toEqual(['c:/work/app/5.5'])
+  // A ">" inside a quoted awk/jq program is a comparison, not a redirect.
+  expect(shellWriteTargets("awk '$1 > 5.5 {print}' data", CWD)).toEqual([])
+  expect(shellWriteTargets("jq '.items[] | select(.n > limit)' in.json > out.json", CWD)).toEqual(['c:/work/app/out.json'])
+})
+
+test('heredoc bodies and quoted code are content, not redirects', () => {
+  // Seen live 2026-11-19: a CSS heredoc (".row-static > .heat") and a python heredoc holding
+  // JSX ("<text ...>" then "{text}") were recorded as edits to files named ".heat" and "{text}".
+  const css = "cd C:/work/app/src && cat > budget.css <<'XEOF'\n.row-static > .heat {\n  margin-left: auto;\n}\nXEOF"
+  expect(shellWriteTargets(css, CWD)).toEqual(['c:/work/app/src/budget.css'])
+  const py = [
+    "python - <<'PYEOF'",
+    "s = '''<text x=\"18\">",
+    '  {text}',
+    "</text>'''",
+    "open('a.tsx','w').write(s)",
+    'PYEOF',
+  ].join('\n')
+  expect(shellWriteTargets(py, CWD)).toEqual([])
+  // Commands after the heredoc's closing line are scanned again.
+  expect(shellWriteTargets('cat <<EOF > notes.md\nline > not-a-file\nEOF\nrun >> after.log', CWD))
+    .toEqual(['c:/work/app/notes.md', 'c:/work/app/after.log'])
+  expect(shellWriteTargets('cat <<-EOF\n\ta > b\n\tEOF', CWD)).toEqual([])
+  // PowerShell here-strings and quoted script code.
+  expect(shellWriteTargets("$t = @'\nif ($a > $b) { x > y.txt }\n'@\nSet-Content -Path out.md -Value $t", CWD)).toEqual(['c:/work/app/out.md'])
+  expect(shellWriteTargets('node -e "if (a > b) console.log(1)"', CWD)).toEqual([])
+  expect(shellWriteTargets('echo "a > b" > real.txt', CWD)).toEqual(['c:/work/app/real.txt'])
+  expect(shellWriteTargets(`echo 'it''s' > "two words.txt"`, CWD)).toEqual(['c:/work/app/two words.txt'])
+})
+
+test('sed with several -e scripts names only the files', () => {
+  // Seen live: the second script ("s/\[0u64;4\]/[0u64;1]/") and a bare "-e" were recorded as files.
+  expect(shellWriteTargets(String.raw`sed -i -e 's/^a.*/b/' -e 's/\[0u64;4\]/[0u64;1]/' dp3s.rs; rustc dp3s.rs`, CWD))
+    .toEqual(['c:/work/app/dp3s.rs'])
+  // A script with shell-escaped quotes still yields the file.
+  expect(shellWriteTargets(`sed -i 's/the author'"'"'s README/the NOTICE/' README.md`, CWD)).toEqual(['c:/work/app/readme.md'])
 })
 
 test('git targets the folder -C or a leading cd names', () => {
